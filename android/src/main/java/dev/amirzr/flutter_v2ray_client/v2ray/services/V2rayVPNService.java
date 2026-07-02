@@ -125,6 +125,12 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         builder.setSession(v2rayConfig.REMARK);
         builder.setMtu(1500);
         builder.addAddress("26.26.26.1", 30);
+        // IPv6 (doft): give the TUN a v6 address + route ALL IPv6 into the tunnel so
+        // it can't leak on the underlying interface on a dual-stack network. Upstream
+        // only routes IPv4. da26:2626::1/126 mirrors the v4 26.26.26.1/30; tun2socks
+        // gets the ::2 netif via --netif-ip6addr below (the bundled binary supports it).
+        builder.addAddress("da26:2626::1", 126);
+        builder.addRoute("::", 0);
 
         if (v2rayConfig.BYPASS_SUBNETS == null || v2rayConfig.BYPASS_SUBNETS.isEmpty()) {
             builder.addRoute("0.0.0.0", 0);
@@ -205,6 +211,9 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
                 Arrays.asList(new File(getApplicationInfo().nativeLibraryDir, "libtun2socks.so").getAbsolutePath(),
                         "--netif-ipaddr", "26.26.26.2",
                         "--netif-netmask", "255.255.255.252",
+                        // IPv6 (doft): v6 gateway for badvpn, matches the TUN da26:2626::1/126
+                        // so the ::/0 route above is forwarded (not dropped) to the SOCKS core.
+                        "--netif-ip6addr", "da26:2626::2",
                         "--socks-server-addr", "127.0.0.1:" + v2rayConfig.LOCAL_SOCKS5_PORT,
                         "--tunmtu", "1500",
                         "--sock-path", "sock_path",

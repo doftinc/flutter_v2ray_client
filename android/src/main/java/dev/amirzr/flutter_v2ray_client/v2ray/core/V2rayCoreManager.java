@@ -313,13 +313,15 @@ public final class V2rayCoreManager {
             return;
         }
 
-        // Check notification permission for Android 13+
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ActivityCompat.checkSelfPermission(context,
-                    Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                return;
-            }
-        }
+        // IMPORTANT: do NOT early-return when POST_NOTIFICATIONS (Android 13+) is denied.
+        // This method is the ONLY caller of startForeground(), and the service was launched
+        // via startForegroundService() — so skipping startForeground() makes the OS kill the
+        // process with ForegroundServiceDidNotStartInTimeException ~5s later (a hard crash on
+        // API 31+). Every user who declined the notification permission would crash on Connect.
+        // startForeground() does NOT require POST_NOTIFICATIONS: the foreground service starts
+        // fine and the ongoing notification is simply suppressed by the OS when the permission
+        // is denied. So always build the notification + call startForeground() below; the
+        // permission only governs whether that notification is actually shown to the user.
 
         Intent launchIntent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
         if (launchIntent != null) {

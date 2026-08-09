@@ -46,6 +46,23 @@ public final class V2rayCoreManager {
     private CountDownTimer countDownTimer;
     private int seconds, minutes, hours;
     private long totalDownload, totalUpload, uploadSpeed, downloadSpeed;
+    /**
+     * Outbound tags the traffic counters are summed over.
+     *
+     * <p>xray keys its stats counters by OUTBOUND TAG ({@code outbound&gt;&gt;&gt;<tag>&gt;&gt;&gt;traffic&gt;&gt;&gt;…})
+     * and {@code queryStats} matches that name exactly — there is no prefix or wildcard
+     * form. Reading only {@code "proxy"} was therefore correct exactly as long as the
+     * config had a single proxy outbound. It does not any more: the Doft client emits a
+     * {@code burstObservatory} + routing balancer over {@code proxy}, {@code proxy-r1},
+     * {@code proxy-cdn}, {@code proxy-ss}, {@code proxy-hy2} …, so every byte the
+     * balancer routes through a member other than {@code proxy} was invisible — and the
+     * app meters its free tier, confirms the device identity and vetoes false failovers
+     * from these numbers.
+     *
+     * <p>Populated from the running config in {@link #startCore}; the defaults are the
+     * historical behaviour, so a config we cannot parse degrades to what it did before.
+     */
+    private volatile String[] statsTags = new String[] { "block", "proxy" };
     private String SERVICE_DURATION = "00:00:00";
 
     public static V2rayCoreManager getInstance() {
@@ -77,10 +94,20 @@ public final class V2rayCoreManager {
                     hours = 0;
                 }
                 if (enable_traffic_statics) {
-                    downloadSpeed = (coreController != null ? coreController.queryStats("block", "downlink") : 0)
-                            + (coreController != null ? coreController.queryStats("proxy", "downlink") : 0);
-                    uploadSpeed = (coreController != null ? coreController.queryStats("block", "uplink") : 0)
-                            + (coreController != null ? coreController.queryStats("proxy", "uplink") : 0);
+                    // Sum over EVERY outbound tag in the running config, not just "proxy".
+                    // queryStats also RESETS the counter it reads, so a tag left unread is
+                    // not merely unreported — those bytes are gone. A tag that does not
+                    // exist returns 0, so an over-broad list is free.
+                    long dn = 0, up = 0;
+                    final String[] tags = statsTags;
+                    if (coreController != null) {
+                        for (int t = 0; t < tags.length; t++) {
+                            dn += coreController.queryStats(tags[t], "downlink");
+                            up += coreController.queryStats(tags[t], "uplink");
+                        }
+                    }
+                    downloadSpeed = dn;
+                    uploadSpeed = up;
                     totalDownload = totalDownload + downloadSpeed;
                     totalUpload = totalUpload + uploadSpeed;
                 }
@@ -181,6 +208,7 @@ public final class V2rayCoreManager {
     }
 
     public boolean startCore(final V2rayConfig v2rayConfig) {
+        statsTags = readOutboundTags(v2rayConfig.V2RAY_FULL_JSON_CONFIG);
         makeDurationTimer(v2rayServicesListener.getService().getApplicationContext(),
                 v2rayConfig.ENABLE_TRAFFIC_STATICS);
         V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_CONNECTING;
@@ -215,6 +243,43 @@ public final class V2rayCoreManager {
             return false;
         }
         return true;
+    }
+
+    /**
+     * The PROXY outbound tags in the config — {@code proxy} and anything the balancer
+     * added beside it ({@code proxy-r1}, {@code proxy-cdn}, {@code proxy-ss},
+     * {@code proxy-hy2} …) — plus {@code block}, exactly as before.
+     *
+     * <p>⚠ {@code direct} and {@code dns-out} are DELIBERATELY EXCLUDED. They carry the
+     * split-tunnel and bypassed-domain traffic, which leaves the machine outside the
+     * tunnel; the app meters its free data allowance from these counters, so counting
+     * bypassed bytes would charge users for traffic the VPN never carried. The previous
+     * behaviour was {@code block + proxy}, and this is the same set plus the members
+     * that only exist because one outbound became several.
+     *
+     * <p>Falls back to {@code {"block", "proxy"}} on any parse failure, i.e. to exactly
+     * what this code did before.
+     */
+    private static String[] readOutboundTags(final String fullJsonConfig) {
+        try {
+            final org.json.JSONArray outbounds =
+                    new JSONObject(fullJsonConfig).getJSONArray("outbounds");
+            final java.util.ArrayList<String> tags = new java.util.ArrayList<>();
+            tags.add("block");
+            for (int i = 0; i < outbounds.length(); i++) {
+                final String tag = outbounds.getJSONObject(i).optString("tag", "");
+                if (tag.startsWith("proxy") && !tags.contains(tag)) {
+                    tags.add(tag);
+                }
+            }
+            if (tags.size() > 1) {
+                return tags.toArray(new String[0]);
+            }
+        } catch (Exception e) {
+            Log.w(V2rayCoreManager.class.getSimpleName(),
+                    "readOutboundTags failed, falling back to block+proxy", e);
+        }
+        return new String[] { "block", "proxy" };
     }
 
     public void stopCore() {

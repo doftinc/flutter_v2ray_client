@@ -30,3 +30,17 @@ javac -nowarn -cp "$JSON_JAR" -d build/classes \
   $(find stubs -name '*.java') \
   "$SRC/utils/Utilities.java" "$SRC/utils/AppConfigs.java" "$SRC/utils/V2rayConfig.java"
 java -cp "build/classes:$JSON_JAR" Harness
+
+# ── TUIC config rewrite ───────────────────────────────────────────────────────────
+# ⚠ THE ONE THAT CAN LEAK. When the TUIC listener does not come up, this decides
+# whether the outbound is dropped or kept. Drop a MEMBER: correct. Drop the PRIMARY and
+# xray falls through to the next outbound, which is `freedom` — every byte the user
+# believes is tunnelled leaves in clear. Removing the fail-closed branch makes two of
+# these fail, naming `freedom` as outbounds[0].
+echo
+javac -nowarn -cp "$JSON_JAR" -d build/tclasses \
+  TuicRewriteHarness.java \
+  stubs/android/util/Log.java \
+  "$SRC/core/TuicConfigRewriter.java"
+java -cp "build/tclasses:$JSON_JAR" \
+  dev.amirzr.flutter_v2ray_client.v2ray.core.TuicRewriteHarness

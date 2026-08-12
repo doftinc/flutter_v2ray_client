@@ -535,52 +535,7 @@ public final class V2rayCoreManager {
             Log.e(V2rayCoreManager.class.getSimpleName(), "tuic: listener failed to start", e);
         }
 
-        try {
-            org.json.JSONArray outs = root.optJSONArray("outbounds");
-            if (outs == null) {
-                return root.toString();
-            }
-            org.json.JSONArray kept = new org.json.JSONArray();
-            for (int i = 0; i < outs.length(); i++) {
-                org.json.JSONObject o = outs.optJSONObject(i);
-                String tag = (o == null) ? "" : o.optString("tag", "");
-                if (!tag.startsWith("proxy-tuic")) {
-                    kept.put(outs.get(i));
-                    continue;
-                }
-                org.json.JSONObject settings = o.optJSONObject("settings");
-                org.json.JSONArray servers =
-                        (settings == null) ? null : settings.optJSONArray("servers");
-                if (port <= 0 || servers == null) {
-                    // ⚠ FAIL OPEN: DROP THE MEMBER, do not leave it pointing at a dead
-                    // port. A member that fails every probe still costs the balancer a
-                    // health check every interval — on the engine whose probe budget is
-                    // already scaled by member count, over a thin mobile line. The tunnel
-                    // comes up on the other transports exactly as it would have without
-                    // TUIC configured at all.
-                    Log.w(V2rayCoreManager.class.getSimpleName(),
-                            "tuic: dropping " + tag + " (port=" + port + ")");
-                    continue;
-                }
-                for (int k = 0; k < servers.length(); k++) {
-                    org.json.JSONObject s = servers.optJSONObject(k);
-                    if (s != null) {
-                        s.put("port", port);
-                    }
-                }
-                kept.put(o);
-            }
-            root.put("outbounds", kept);
-            if (port > 0) {
-                Log.i(V2rayCoreManager.class.getSimpleName(),
-                        "tuic: listening on 127.0.0.1:" + port);
-            }
-        } catch (Throwable e) {
-            // Anything unexpected while rewriting: hand back the stripped config as it
-            // stood. Worst case a proxy-tuic member survives with port 0 and fails its
-            // probes — bounded, and never a failed connect for an unrelated transport.
-            Log.e(V2rayCoreManager.class.getSimpleName(), "tuic: rewrite failed", e);
-        }
-        return root.toString();
+        return TuicConfigRewriter.rewrite(root, port);
     }
+
 }

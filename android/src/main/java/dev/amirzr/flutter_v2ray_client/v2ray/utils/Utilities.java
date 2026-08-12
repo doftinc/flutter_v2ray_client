@@ -92,25 +92,51 @@ public class Utilities {
                 Log.w(V2rayCoreManager.class.getSimpleName(), "startCore warn => can`t find inbound port of socks5 or http.");
                 return null;
             }
-            try {
-                v2rayConfig.CONNECTED_V2RAY_SERVER_ADDRESS = config_json.getJSONArray("outbounds")
-                        .getJSONObject(0).getJSONObject("settings")
-                        .getJSONArray("vnext").getJSONObject(0)
-                        .getString("address");
-                v2rayConfig.CONNECTED_V2RAY_SERVER_PORT = config_json.getJSONArray("outbounds")
-                        .getJSONObject(0).getJSONObject("settings")
-                        .getJSONArray("vnext").getJSONObject(0)
-                        .getString("port");
-            } catch (Exception e) {
-                v2rayConfig.CONNECTED_V2RAY_SERVER_ADDRESS = config_json.getJSONArray("outbounds")
-                        .getJSONObject(0).getJSONObject("settings")
-                        .getJSONArray("servers").getJSONObject(0)
-                        .getString("address");
-                v2rayConfig.CONNECTED_V2RAY_SERVER_PORT = config_json.getJSONArray("outbounds")
-                        .getJSONObject(0).getJSONObject("settings")
-                        .getJSONArray("servers").getJSONObject(0)
-                        .getString("port");
+            // ⚠ THIS BLOCK DECIDED WHICH PROTOCOLS ANDROID COULD LEAD WITH, and nobody
+            // meant it to. It read the endpoint from `settings.vnext[0]` (VLESS/VMess)
+            // and fell back to `settings.servers[0]` (Shadowsocks/SOCKS/Trojan). A
+            // HYSTERIA outbound carries neither — its endpoint is `settings.address` /
+            // `settings.port` directly — so both lookups threw, the whole parse returned
+            // null, and `V2rayController.StartV2ray` did a BARE `return`: no exception,
+            // no callback, no log. Dart's future completed and the app reported itself
+            // connected with no core running. That is the 2026-08-09 outage, and it is
+            // why Hysteria2 has been documented ever since as "can never be the primary
+            // outbound on Android" — a limit of this method, not of xray, which dials
+            // that outbound perfectly well (measured 765 KB/s from Krasnodar as a
+            // balancer member, on the same core, in the same process).
+            //
+            // Read every shape, in the order that disambiguates them, and treat "no
+            // endpoint at all" as the hard error it is rather than as a silent null.
+            JSONObject firstOut = config_json.getJSONArray("outbounds").getJSONObject(0);
+            JSONObject outSettings = firstOut.optJSONObject("settings");
+            String addr = "", port = "";
+            if (outSettings != null) {
+                JSONArray vnext = outSettings.optJSONArray("vnext");
+                JSONArray servers = outSettings.optJSONArray("servers");
+                if (vnext != null && vnext.length() > 0) {
+                    addr = vnext.getJSONObject(0).optString("address", "");
+                    port = vnext.getJSONObject(0).optString("port", "");
+                } else if (servers != null && servers.length() > 0) {
+                    addr = servers.getJSONObject(0).optString("address", "");
+                    port = servers.getJSONObject(0).optString("port", "");
+                } else {
+                    // hysteria (and anything else that names its endpoint inline)
+                    addr = outSettings.optString("address", "");
+                    port = outSettings.optString("port", "");
+                }
             }
+            if (addr.isEmpty()) {
+                // ⚠ LOUD. The address is handed to `Libv2ray.setProtectorServer`, and a
+                // start with no endpoint is a bug in the config we were given — the one
+                // thing that must never again look like a successful connect.
+                Log.e(Utilities.class.getName(),
+                        "parseV2rayJsonFile: outbounds[0] names no endpoint (protocol="
+                                + firstOut.optString("protocol", "?")
+                                + ") — refusing to start with an unknown server");
+                return null;
+            }
+            v2rayConfig.CONNECTED_V2RAY_SERVER_ADDRESS = addr;
+            v2rayConfig.CONNECTED_V2RAY_SERVER_PORT = port;
             try {
                 if (config_json.has("policy")) {
                     config_json.remove("policy");

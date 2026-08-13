@@ -439,7 +439,19 @@ public final class V2rayCoreManager {
                     notificationChannelID)
                     .setSmallIcon(v2rayConfig.APPLICATION_ICON)
                     .setContentTitle(v2rayConfig.REMARK)
-                    .addAction(0, v2rayConfig.NOTIFICATION_DISCONNECT_BUTTON_NAME, notificationContentPendingIntent)
+                    // ⚠ THIS IS `pendingIntent`, NOT `notificationContentPendingIntent`.
+                    // It used to be the latter, which made the "Disconnect" button open
+                    // the app with action FROM_DISCONNECT_BTN — a string nothing in this
+                    // plugin or in the app has ever read. So the button disconnected
+                    // nothing, and `stopIntent` (and with it every
+                    // AppConfigs.V2RAY_CONNECTION_MODE assignment in the two services,
+                    // whose only job is to choose which service class that intent names)
+                    // was computed and thrown away. `pendingIntent` carries
+                    // COMMAND=STOP_SERVICE to the service that is actually running, which
+                    // clears the autostart slot and broadcasts DISCONNECTED for the app to
+                    // pick up. Tapping the notification BODY still opens the app —
+                    // that is what setContentIntent below is for.
+                    .addAction(0, v2rayConfig.NOTIFICATION_DISCONNECT_BUTTON_NAME, pendingIntent)
                     .setPriority(NotificationCompat.PRIORITY_MIN)
                     .setShowWhen(false)
                     .setOnlyAlertOnce(true)
@@ -452,6 +464,24 @@ public final class V2rayCoreManager {
             Log.w("V2rayCoreManager", "Failed to show notification, continuing without notification", e);
             // VPN/Proxy continues to work even if notification fails
         }
+    }
+
+    /**
+     * Total DOWNLINK bytes counted since {@link #setUpListener} initialised the core,
+     * summed over every outbound tag in {@code statsTags}.
+     *
+     * <p>⚠ THIS IS THE ONLY EVIDENCE THE DAEMON PROCESS HAS THAT A TUNNEL ACTUALLY WORKS,
+     * and {@code V2rayVPNService} bounds its unattended restore chain on it. A tun
+     * interface, a running core and a completed handshake are all satisfied by a
+     * black-holed entry IP; bytes coming back are not. Downlink specifically: uplink
+     * rises whether or not anything is at the far end.
+     *
+     * <p>⚠ IT ONLY MOVES WHEN {@code ENABLE_TRAFFIC_STATICS} IS SET on the running config
+     * — {@link #makeDurationTimer} skips {@code queryStats} otherwise — which is why the
+     * restore path forces that flag on before {@link #startCore}.
+     */
+    public long getTotalDownloadBytes() {
+        return totalDownload;
     }
 
     public boolean isV2rayCoreRunning() {

@@ -33,11 +33,21 @@ public class V2rayCoreManager {
   public static int stopServiceCallbacks = 0;
   public static Object lastConfig = null;
   public static Object listener = null;
+  /**
+   * The DOWNLINK byte counter the restore chain is bound on. ⚠ A HARNESS THAT COULD NOT
+   * HOLD THIS AT ZERO WHILE HANDING BACK A TUN COULD NOT MODEL A BLACK HOLE AT ALL — the
+   * whole point of the round-4 fix is that establish() succeeding and bytes moving are
+   * different events, so the fake has to be able to separate them.
+   */
+  public static long totalDownloadBytes = 0L;
 
   public static void reset(){
     coreRunning = false; startCoreResult = true; startCoreCalls = 0;
     stopCoreCalls = 0; stopServiceCallbacks = 0; lastConfig = null; listener = null;
+    totalDownloadBytes = 0L;
   }
+
+  public long getTotalDownloadBytes(){ return totalDownloadBytes; }
 
   public void setUpListener(Object l){ listener = l; }
   public boolean isV2rayCoreRunning(){ return coreRunning; }

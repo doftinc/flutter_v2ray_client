@@ -58,14 +58,17 @@ import java.util.ArrayList;
  *
  * <ul>
  *   <li><b>"This config keeps FAILING."</b> Bounded hard, and this is the only bound that
- *       is on by default: {@link #MAX_CONSECUTIVE_FAILURES} restores that do not produce a
- *       tunnel and the blob is dropped. The counter is charged BEFORE the attempt and
+ *       is on by default: {@link #MAX_CONSECUTIVE_FAILURES} restores that do not CARRY
+ *       TRAFFIC and the blob is dropped. The counter is charged BEFORE the attempt and
  *       committed synchronously (see {@link #beginRestoreAttempt}), and it is cleared ONLY
- *       by {@link #noteRestoreSucceeded}, which the VPN service calls only with a tun
- *       interface in hand — never on {@code startCore()} returning true. So a config that
- *       black-holes, or that starts a core and never gets an interface, or that takes the
- *       process down with it, ends the loop after three tries whatever the framework
- *       does.</li>
+ *       by {@link #noteTunnelCarriedTraffic}, which the VPN service calls only once
+ *       DOWNLINK BYTES HAVE ACTUALLY MOVED through the interface — never on
+ *       {@code startCore()} returning true, and never on {@code builder.establish()}
+ *       handing back an interface. <b>A BLACK-HOLED ENTRY IP SATISFIES BOTH OF THOSE</b>:
+ *       the tun establishes, the core runs, the handshake completes, and nothing comes
+ *       back. So a config that black-holes, or that starts a core and never gets an
+ *       interface, or that takes the process down with it, ends the loop after three
+ *       tries whatever the framework does.</li>
  *   <li><b>"This config keeps WORKING and nobody has opened the app."</b> NOT bounded.
  *       There is no number of successful reboots after which a working tunnel should turn
  *       itself off, and every candidate number is a date on which somebody's device
@@ -509,17 +512,28 @@ public final class AutoStartStore {
     }
 
     /**
-     * A restore produced a real tunnel; forget the failures that preceded it.
+     * The tunnel this restore built has CARRIED DOWNLINK TRAFFIC; forget the failures
+     * that preceded it.
      *
-     * <p>⚠ CALL THIS ONLY WITH A TUN INTERFACE IN HAND. {@code startCore()} returning
-     * true means the core loop started, not that any traffic can leave;
-     * {@code builder.establish()} RETURNS NULL rather than throwing when we are not the
-     * prepared VPN, and a budget cleared on that path never bites.
+     * <p>⚠ THE NAME IS THE POINT, AND IT USED TO BE {@code noteRestoreSucceeded}. The old
+     * name invited the old call site: {@code V2rayVPNService.setup()} called it the
+     * moment {@code builder.establish()} handed back a non-null interface, i.e. it
+     * treated "the OS gave us a tun" as "the tunnel works". <b>A BLACK-HOLED ENTRY IP
+     * SATISFIES THAT.</b> The tun establishes, the core runs, the handshake completes,
+     * and zero bytes come back — the shape measured on 85.189.101.44 on 2026-08-12, where
+     * every transport and both engines read 0 KB/s while the node looked healthy from
+     * outside. Clearing the budget there meant an always-on device restored a
+     * zero-throughput tunnel on every boot, forever, with the failure budget reset each
+     * time; with the kill switch on that is a phone with no connectivity and no signal.
+     *
+     * <p>So the only caller is the watcher in {@code V2rayVPNService} that has seen
+     * downlink bytes accumulate through the interface. Downlink is the discriminator on
+     * purpose: uplink rises whether or not anything is at the other end.
      *
      * <p>It deliberately does NOT touch the unattended-restore counter: a restore chain
      * that works is exactly the one that must still end, because nothing is metering it.
      */
-    public static void noteRestoreSucceeded(final Context context, final String slot) {
+    public static void noteTunnelCarriedTraffic(final Context context, final String slot) {
         if (context == null) {
             return;
         }

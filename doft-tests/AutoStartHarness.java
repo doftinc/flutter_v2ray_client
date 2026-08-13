@@ -47,19 +47,27 @@ public class AutoStartHarness {
     static class FakeResources extends Resources {
         static final int ICON = 0x7f080001;
         static final int A_STRING = 0x7f0f0002;
+        /**
+         * What the launcher icon's id is RIGHT NOW. ⚠ aapt renumbers resource ids on every
+         * app update, which is the whole reason save() records the resource NAME as well
+         * as the number; a fake that could not move the number could not model the update.
+         */
+        int icon = ICON;
+
+        void renumber(int newId) { icon = newId; }
 
         public int getIdentifier(String name, String defType, String defPackage) {
-            return "com.doft.vpn:mipmap/ic_launcher".equals(name) ? ICON : 0;
+            return "com.doft.vpn:mipmap/ic_launcher".equals(name) ? icon : 0;
         }
 
         public String getResourceName(int id) {
-            if (id == ICON) return "com.doft.vpn:mipmap/ic_launcher";
+            if (id == ICON || id == icon) return "com.doft.vpn:mipmap/ic_launcher";
             if (id == A_STRING) return "com.doft.vpn:string/app_name";
             throw new RuntimeException("no resource " + id);
         }
 
         public String getResourceTypeName(int id) {
-            if (id == ICON) return "mipmap";
+            if (id == ICON || id == icon) return "mipmap";
             if (id == A_STRING) return "string";
             throw new RuntimeException("no resource " + id);
         }
@@ -70,7 +78,7 @@ public class AutoStartHarness {
         final LosablePrefs prefs = new LosablePrefs();
         /** the always-written file: timestamps and counters, a few dozen bytes */
         final LosablePrefs state = new LosablePrefs();
-        final Resources res = new FakeResources();
+        final FakeResources res = new FakeResources();
 
         /** the process is killed before any unflushed apply() reached the disk */
         void processDied() {
@@ -264,7 +272,7 @@ public class AutoStartHarness {
             AutoStartStore.save(ctx, SLOT, sample());
             AutoStartStore.beginRestoreAttempt(ctx, SLOT);
             AutoStartStore.beginRestoreAttempt(ctx, SLOT);
-            AutoStartStore.noteRestoreSucceeded(ctx, SLOT);
+            AutoStartStore.noteTunnelCarriedTraffic(ctx, SLOT);
             boolean stillAllowed = AutoStartStore.beginRestoreAttempt(ctx, SLOT)
                     && AutoStartStore.beginRestoreAttempt(ctx, SLOT)
                     && AutoStartStore.beginRestoreAttempt(ctx, SLOT);
@@ -430,7 +438,7 @@ public class AutoStartHarness {
             AutoStartStore.beginRestoreAttempt(ctx, SLOT);
             AutoStartStore.beginRestoreAttempt(ctx, SLOT);
             ctx.losingApplies();
-            AutoStartStore.noteRestoreSucceeded(ctx, SLOT); // an apply() write, by design
+            AutoStartStore.noteTunnelCarriedTraffic(ctx, SLOT); // an apply() write, by design
             check("harness self-test: an unflushed apply() is visible in-process",
                     ctx.state.getInt("vpn_failures", -1) == 0, "" + ctx.state.getInt("vpn_failures", -1));
             ctx.processDied();
@@ -482,6 +490,87 @@ public class AutoStartHarness {
                     ctx.prefs.map.get("vpn_schema") == null, "still on disk");
             check("nothing restores after a clear that raced a kill",
                     AutoStartStore.load(ctx, SLOT) == null, "loaded");
+        }
+
+        // 17. clear()'s OTHER FILE. The state prefs hold the failure count, the
+        //     unattended-restore count and the save time; reverting THAT commit() to
+        //     apply() left the suite green because case 16 only ever looked at the blob
+        //     file. A stale failure count that survives a clear is a config the next
+        //     app-initiated connect starts three-quarters of the way to being dropped,
+        //     and a stale save time can age a fresh blob out on its first restore.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            AutoStartStore.beginRestoreAttempt(ctx, SLOT);
+            AutoStartStore.beginRestoreAttempt(ctx, SLOT);
+            ctx.losingApplies();
+            AutoStartStore.clear(ctx, SLOT);
+            ctx.processDied();
+            check("clear() survives a kill: the failure count is gone from disk",
+                    ctx.state.map.get("vpn_failures") == null,
+                    "still " + ctx.state.map.get("vpn_failures"));
+            check("clear() survives a kill: the unattended-restore count is gone too",
+                    ctx.state.map.get("vpn_restores") == null,
+                    "still " + ctx.state.map.get("vpn_restores"));
+            check("clear() survives a kill: the save time is gone too",
+                    ctx.state.map.get("vpn_saved_at") == null,
+                    "still " + ctx.state.map.get("vpn_saved_at"));
+        }
+
+        // 18. ⚠ A RESOURCE ID IS NOT STABLE ACROSS AN APP UPDATE - aapt renumbers them,
+        //     and a stale id reaching setSmallIcon() makes the notification fail to build,
+        //     which misses the only startForeground() on the path and gets the process
+        //     killed for the FGS deadline (6205a88). save() records the resource NAME for
+        //     exactly that reason; deleting that write left the suite green because
+        //     nothing ever renumbered anything.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            // the app updated: the old numeric id now belongs to nothing
+            ctx.res.renumber(0x7f080099);
+            V2rayConfig out = AutoStartStore.load(ctx, SLOT);
+            check("the icon survives an app update that renumbered it",
+                    out != null && out.APPLICATION_ICON == 0x7f080099,
+                    "" + (out == null ? "null config" : out.APPLICATION_ICON));
+        }
+
+        // 19. BYPASS_SUBNETS ROUND-TRIPS WHEN IT IS NOT NULL. The existing round trip only
+        //     ever asserted the null case, so deleting the write entirely stayed green -
+        //     and a lost bypass list means traffic that must not enter the tunnel enters
+        //     it (LAN, captive portals, the operator's own management ranges).
+        {
+            FakeContext ctx = new FakeContext();
+            V2rayConfig in = sample();
+            in.BYPASS_SUBNETS = new ArrayList<>();
+            in.BYPASS_SUBNETS.add("192.168.0.0/16");
+            in.BYPASS_SUBNETS.add("10.0.0.0/8");
+            AutoStartStore.save(ctx, SLOT, in);
+            V2rayConfig out = AutoStartStore.load(ctx, SLOT);
+            check("bypass subnets survive the round trip",
+                    out != null && out.BYPASS_SUBNETS != null
+                            && out.BYPASS_SUBNETS.size() == 2
+                            && "192.168.0.0/16".equals(out.BYPASS_SUBNETS.get(0))
+                            && "10.0.0.0/8".equals(out.BYPASS_SUBNETS.get(1)),
+                    out == null ? "null" : String.valueOf(out.BYPASS_SUBNETS));
+        }
+
+        // 20. ⚠ A SAVE THAT CANNOT BE RESTORED FROM MUST NOT DESTROY THE ONE THAT CAN.
+        //     save() refuses a config with no core JSON. Reverting that guard to a
+        //     constant false left the suite green, and the cost of losing it is not "a
+        //     bad blob is stored" - it is that the empty write REPLACES the previous
+        //     known-good blob, so an always-on device has nothing to restore at all.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            check("armed with a good config", ctx.prefs.map.get("vpn_config") != null, "nothing stored");
+            V2rayConfig empty = sample();
+            empty.V2RAY_FULL_JSON_CONFIG = "";
+            AutoStartStore.save(ctx, SLOT, empty);
+            V2rayConfig out = AutoStartStore.load(ctx, SLOT);
+            check("a config with an EMPTY core JSON does not overwrite the good one",
+                    out != null && out.V2RAY_FULL_JSON_CONFIG != null
+                            && !out.V2RAY_FULL_JSON_CONFIG.isEmpty(),
+                    "the known-good blob was destroyed");
         }
 
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));

@@ -35,6 +35,46 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
     private V2rayConfig v2rayConfig;
     private volatile boolean isRunning = true;
 
+    /**
+     * How many downlink bytes this tunnel has to carry before the restore that built it
+     * counts as a success.
+     *
+     * <p>⚠ THIS NUMBER EXISTS BECAUSE {@code builder.establish() != null} IS NOT A
+     * SUCCESS SIGNAL. A black-holed entry IP establishes a tun, runs a core, completes a
+     * handshake and moves nothing — the shape measured on 85.189.101.44 on 2026-08-12,
+     * where every transport on both engines read 0 KB/s while the node looked healthy
+     * from outside, and the shape of the reality-on-.89 result (CDN connects, volume 0).
+     * Clearing the failure budget on establish() therefore let an always-on device
+     * restore a dead tunnel on every boot forever.
+     *
+     * <p><b>DOWNLINK, not uplink</b>: uplink rises whether or not there is anything at the
+     * other end. Downlink only rises when the far side answered.
+     *
+     * <p><b>512 KiB is a judgement, not a measurement.</b> It has to sit above whatever a
+     * black hole can return by accident — the handshakes it does complete are a few KB
+     * each, and a client that retries all night could accumulate a few tens of KB — and
+     * below anything a working tunnel on a phone reaches within minutes of a boot (one
+     * app-store metadata refresh is larger). If a device is ever seen losing its blob
+     * with a healthy tunnel, this is the number that is wrong, not the mechanism.
+     */
+    private static final long PROOF_DOWNLINK_BYTES = 512L * 1024L;
+
+    /**
+     * How often the proof watcher looks. Nothing is latency-sensitive here — the only
+     * deadline is "before the next restore" — so this is deliberately slow and cheap.
+     * ⚠ Not final: the test harness lowers it by reflection so the watcher can be driven
+     * end to end in a bounded run.
+     */
+    private static volatile long PROOF_POLL_MS = 5000L;
+
+    /**
+     * Bumped by every {@link #setup()} that establishes an interface. A watcher whose
+     * generation is stale exits: without it, a tun torn down and rebuilt inside one
+     * process would leave the older watcher crediting the newer tunnel's bytes.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger tunGeneration =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -155,6 +195,13 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         }
 
         v2rayConfig = restored;
+        // ⚠ THE PROOF DEPENDS ON THE COUNTERS RUNNING. V2rayCoreManager only polls
+        // queryStats when the config asks for traffic statistics, and the whole bound on
+        // this restore chain is "did downlink bytes move" (see PROOF_DOWNLINK_BYTES). A
+        // restored session with statistics off would never be able to prove itself, and
+        // would burn its failure budget while working perfectly. The cost is one
+        // queryStats per outbound tag per second, on a path with no app process watching.
+        restored.ENABLE_TRAFFIC_STATICS = true;
         // This process starts fresh on a sticky restart, so the static is back at its
         // default; showNotification() reads it to aim the notification's stop button.
         AppConfigs.V2RAY_CONNECTION_MODE = AppConfigs.V2RAY_CONNECTION_MODES.VPN_TUN;
@@ -367,11 +414,91 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         }
         mInterface = tun;
         isRunning = true;
-        // A tun interface exists, so whatever config produced it is known-good: this is
-        // the only place the restore budget may be cleared (see restoreLastKnownGood).
-        // Harmless on the user-initiated path, where save() has already cleared it.
-        AutoStartStore.noteRestoreSucceeded(this, AutoStartStore.SLOT_VPN);
+        // ⚠ THE BUDGET IS NOT CLEARED HERE, AND A TUN IS NOT A SUCCESS. This line used to
+        // be AutoStartStore.noteRestoreSucceeded(...), on the reasoning that an interface
+        // in hand means the tunnel works. It does not: a BLACK-HOLED ENTRY IP gives us a
+        // tun, a running core and a completed handshake while moving zero bytes, so that
+        // clear let an always-on device restore a dead tunnel on every boot forever with
+        // the budget reset each time — and with the kill switch on, the user has no
+        // connectivity and no signal at all. The budget is now cleared only by the
+        // watcher below, once downlink bytes have actually moved.
+        startRestoreProofWatcher();
         runTun2socks();
+    }
+
+    /**
+     * Watch the tunnel this {@link #setup()} just built until it proves itself by carrying
+     * {@link #PROOF_DOWNLINK_BYTES} of DOWNLINK traffic, and only then clear the restore
+     * failure budget.
+     *
+     * <p>⚠ THIS IS THE BOUND ON THE RESTORE CHAIN, AND IT IS NOT A TIMER. Nothing here
+     * expires and nothing here counts reboots: a config that keeps working restores for
+     * as long as the user wants it to, which is the whole reason the round-2 expiry was
+     * removed (always-on is used by people who never open the app; a bound that switches
+     * it off after N boots or D days is a date on which their phone loses the network).
+     * What is bounded is a config that keeps FAILING — and "failing" now means "carried
+     * nothing", not "did not give us a tun", because the failure this exists to stop is
+     * the one where the tun is perfect and the far side is a black hole.
+     *
+     * <p>The thread is a DAEMON: it must never hold the daemon process up, and there is
+     * no teardown path that is guaranteed to run on a kill.
+     *
+     * <p><b>Known residual risk, stated plainly.</b> A device that restores, moves less
+     * than {@link #PROOF_DOWNLINK_BYTES} through the tunnel, and is killed again — three
+     * times consecutively — loses its blob and has to be re-armed by opening the app.
+     * That is a real hole for a phone that is offline or idle across three consecutive
+     * boots. It is accepted because from inside {@code :RunSoLibV2RayDaemon} an idle
+     * tunnel and a black-holed one are the same observation, and of the two failure modes
+     * the black hole is the unrecoverable one: a dropped blob is repaired by launching the
+     * app, whereas a restored black hole reports itself connected forever and never is.
+     */
+    private void startRestoreProofWatcher() {
+        final int generation = tunGeneration.incrementAndGet();
+        // The counter is not reset between two startCore() calls inside one process, so
+        // the proof is measured against where this tunnel started, not against zero.
+        final long baseline = downlinkBytes();
+        final Thread t = new Thread(() -> {
+            try {
+                while (isRunning && generation == tunGeneration.get()) {
+                    if (restoreProofTick(baseline)) {
+                        return;
+                    }
+                    Thread.sleep(PROOF_POLL_MS);
+                }
+            } catch (InterruptedException ignored) {
+                // teardown
+            } catch (Throwable other) {
+                Log.w(TAG, "restore proof watcher stopped", other);
+            }
+        }, "RestoreProof_Thread");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * One evaluation of the proof. Package-private and separate from the thread so the
+     * test harness can drive it deterministically.
+     *
+     * @return true once the tunnel has proved itself and the budget has been cleared
+     */
+    boolean restoreProofTick(final long baseline) {
+        final long moved = downlinkBytes() - baseline;
+        if (moved < PROOF_DOWNLINK_BYTES) {
+            return false;
+        }
+        Log.i(TAG, "tunnel carried " + moved + " downlink bytes => restore proved");
+        AutoStartStore.noteTunnelCarriedTraffic(this, AutoStartStore.SLOT_VPN);
+        return true;
+    }
+
+    /** Total downlink bytes the core has counted since it was initialised; 0 on error. */
+    private long downlinkBytes() {
+        try {
+            return V2rayCoreManager.getInstance().getTotalDownloadBytes();
+        } catch (Throwable t) {
+            Log.w(TAG, "could not read the downlink counter", t);
+            return 0L;
+        }
     }
 
     private void runTun2socks() {

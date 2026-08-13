@@ -16,8 +16,19 @@ public class VpnService extends Service {
   /** the OTHER failure mode: some devices throw instead. */
   public static boolean establishThrows = false;
   public static int establishCalls = 0;
-  public static void reset(){ prepareResult = null; establishResult = null; establishThrows = false; establishCalls = 0; }
-  public static Intent prepare(Context c){ return prepareResult; }
+  /**
+   * ⚠ prepare() CAN THROW, NOT ONLY RETURN NON-NULL. It is a binder call into the
+   * ConnectivityService; a dead system_server, a DeadObjectException or an OEM policy
+   * hook surfaces as a RuntimeException in OUR process. restoreLastKnownGood() catches
+   * it and must stop the service, because the alternative is a VpnService that stays
+   * alive with no tun while the core is about to be started.
+   */
+  public static boolean prepareThrows = false;
+  public static void reset(){ prepareResult = null; establishResult = null; establishThrows = false; establishCalls = 0; prepareThrows = false; }
+  public static Intent prepare(Context c){
+    if (prepareThrows) { throw new IllegalStateException("system_server is gone"); }
+    return prepareResult;
+  }
   public boolean protect(int socket){ return true; }
   public void onRevoke(){}
   public class Builder {

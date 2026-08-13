@@ -23,8 +23,11 @@ import java.util.Map;
 public class AutoStartHarness {
 
     static int failures = 0;
+    /** counted at runtime so the suite total cannot be hand-typed wrong */
+    static int checks = 0;
 
     static void check(String name, boolean ok, String detail) {
+        checks++;
         if (!ok) {
             failures++;
         }
@@ -34,52 +37,11 @@ public class AutoStartHarness {
 
     // ── fakes ────────────────────────────────────────────────────────────────────────
 
-    /** A working in-memory SharedPreferences: the round trip is real, not mocked out. */
-    static class FakePrefs implements SharedPreferences {
-        final Map<String, Object> map = new HashMap<>();
-        /** ⚠ THE NUMBER THAT MATTERS. apply() rewrites the WHOLE backing XML, so an
-         *  apply() against the file holding the ~100 KB blob rewrites the blob - which is
-         *  why the timestamps and counters live in a different file. Counting a staged
-         *  key would have measured an in-memory flag, not a write. */
-        int applies = 0;
-        int writes = 0;
-
-        public String getString(String k, String def) {
-            Object v = map.get(k);
-            return v instanceof String ? (String) v : def;
-        }
-
-        public int getInt(String k, int def) {
-            Object v = map.get(k);
-            return v instanceof Integer ? (Integer) v : def;
-        }
-
-        public long getLong(String k, long def) {
-            Object v = map.get(k);
-            return v instanceof Long ? (Long) v : def;
-        }
-
-        public Editor edit() {
-            final Map<String, Object> staged = new HashMap<>();
-            final ArrayList<String> removed = new ArrayList<>();
-            return new Editor() {
-                public Editor putString(String k, String v) { staged.put(k, v); return this; }
-                public Editor putInt(String k, int v) { staged.put(k, v); return this; }
-                public Editor putLong(String k, long v) { staged.put(k, v); return this; }
-                public Editor remove(String k) { removed.add(k); return this; }
-                public void apply() {
-                    applies++;
-                    for (String k : removed) {
-                        map.remove(k);
-                    }
-                    map.putAll(staged);
-                    if (staged.containsKey("vpn_config")) {
-                        writes++;
-                    }
-                }
-            };
-        }
-    }
+    /**
+     * ⚠ THE FAKE LIVES IN LosablePrefs, AND ITS apply() CAN BE LOST. It used to be an
+     * in-line map whose apply() landed synchronously, which is a fake that cannot tell
+     * apply() from commit() and therefore passes with either — see case 15.
+     */
 
     /** A resource table with one real drawable and one real string, like an app has. */
     static class FakeResources extends Resources {
@@ -105,10 +67,23 @@ public class AutoStartHarness {
 
     static class FakeContext extends Context {
         /** the rarely-written file: the config blob and its schema */
-        final FakePrefs prefs = new FakePrefs();
+        final LosablePrefs prefs = new LosablePrefs();
         /** the always-written file: timestamps and counters, a few dozen bytes */
-        final FakePrefs state = new FakePrefs();
+        final LosablePrefs state = new LosablePrefs();
         final Resources res = new FakeResources();
+
+        /** the process is killed before any unflushed apply() reached the disk */
+        void processDied() {
+            prefs.processDied();
+            state.processDied();
+        }
+
+        /** every write from here on is an apply() that never lands */
+        FakeContext losingApplies() {
+            prefs.dropUnflushedApplies = true;
+            state.dropUnflushedApplies = true;
+            return this;
+        }
 
         public Context getApplicationContext() { return this; }
 
@@ -322,23 +297,47 @@ public class AutoStartHarness {
                     AutoStartStore.load(ctx, SLOT) == null, "persisted anyway");
         }
 
-        // 13. THE BLOB CARRIES AN EXPIRY, AND THE CLOCK IS THE ONLY THING THAT CAN AGE IT
-        //     across a reboot. Both directions matter: past the TTL it is dropped, and a
-        //     clock that has moved so far backwards that the age is meaningless is not
-        //     treated as "young".
+        // 13. ⚠ THE DEFAULT IS NO EXPIRY, AND THAT IS THE FIX, NOT AN OVERSIGHT.
+        //     A previous revision defaulted to a 7-day TTL and 8 unattended restores.
+        //     Always-on VPN is the feature whose users never open the app - that is what
+        //     they turned it on for - so those numbers made the feature switch itself off
+        //     after a week or eight reboots, and with the kill switch on that is a phone
+        //     with no network at all until somebody launches the app. What is bounded is
+        //     FAILURE (case 9); a chain that keeps producing tunnels is not bounded.
         {
             FakeContext ctx = new FakeContext();
             AutoStartStore.save(ctx, SLOT, sample());
-            check("fresh blob loads", AutoStartStore.load(ctx, SLOT) != null, "null");
 
-            ctx.state.map.put("vpn_saved_at", System.currentTimeMillis() - 8L * 24 * 3600 * 1000);
-            check("past the default TTL: no tunnel", AutoStartStore.load(ctx, SLOT) == null, "loaded");
-            check("past the default TTL: dropped", ctx.prefs.map.get("vpn_config") == null, "kept");
+            // a year of reboots on a device nobody has opened the app on
+            ctx.state.map.put("vpn_saved_at", System.currentTimeMillis() - 400L * 24 * 3600 * 1000);
+            check("a 400-day-old blob with no ttl policy still restores",
+                    AutoStartStore.load(ctx, SLOT) != null, "dropped a working config");
+            ctx.state.map.put("vpn_restores", 300);
+            check("300 unattended restores do not end an unmetered chain",
+                    AutoStartStore.load(ctx, SLOT) != null, "dropped a working config");
+            check("and the blob is still there to restore from",
+                    ctx.prefs.map.get("vpn_config") != null, "dropped");
+        }
+
+        // 13b. AN EXPLICIT ttl_ms IS ENFORCED STRICTLY. This is the instrument for a
+        //      session that must be metered by an app process; the Dart side sets it
+        //      because it is the side that knows the entitlement.
+        {
+            FakeContext ctx = new FakeContext();
+            V2rayConfig metered = sample();
+            metered.V2RAY_FULL_JSON_CONFIG =
+                    "{\"outbounds\":[],\"_doft_autostart\":{\"ttl_ms\":3600000}}";
+            AutoStartStore.save(ctx, SLOT, metered);
+            check("a one-hour ttl loads inside the hour", AutoStartStore.load(ctx, SLOT) != null, "null");
+
+            ctx.state.map.put("vpn_saved_at", System.currentTimeMillis() - 3_601_000L);
+            check("past its ttl: no tunnel", AutoStartStore.load(ctx, SLOT) == null, "loaded");
+            check("past its ttl: dropped", ctx.prefs.map.get("vpn_config") == null, "kept");
 
             // A boot before the network fixes the clock reads a few hours early; that is
-            // normal and always-on must still work.
+            // normal, and a metered session must not be killed by it.
             FakeContext ctx2 = new FakeContext();
-            AutoStartStore.save(ctx2, SLOT, sample());
+            AutoStartStore.save(ctx2, SLOT, metered);
             ctx2.state.map.put("vpn_saved_at", System.currentTimeMillis() + 3600_000L);
             check("a small backwards clock jump is tolerated",
                     AutoStartStore.load(ctx2, SLOT) != null, "dropped a usable config");
@@ -348,12 +347,46 @@ public class AutoStartHarness {
                     AutoStartStore.load(ctx2, SLOT) == null, "loaded");
 
             // No save time at all (a state file wiped independently of the blob) is not
-            // "age zero", it is "unknown".
+            // "age zero", it is "unknown" - and a deadline you cannot measure fails closed.
             FakeContext ctx3 = new FakeContext();
-            AutoStartStore.save(ctx3, SLOT, sample());
+            AutoStartStore.save(ctx3, SLOT, metered);
             ctx3.state.map.remove("vpn_saved_at");
-            check("a blob with no save time is not restorable",
+            check("a ttl'd blob with no save time is not restorable",
                     AutoStartStore.load(ctx3, SLOT) == null, "loaded");
+
+            // ...whereas an unmetered blob does not need a save time at all, because
+            // nothing is being measured. Losing the small state file must not cost an
+            // always-on user their tunnel.
+            FakeContext ctx4 = new FakeContext();
+            AutoStartStore.save(ctx4, SLOT, sample());
+            ctx4.state.map.remove("vpn_saved_at");
+            check("an unmetered blob survives a wiped state file",
+                    AutoStartStore.load(ctx4, SLOT) != null, "dropped");
+        }
+
+        // 13c. An explicit finite max_unattended_restores is still enforced.
+        {
+            FakeContext ctx = new FakeContext();
+            V2rayConfig bounded = sample();
+            bounded.V2RAY_FULL_JSON_CONFIG =
+                    "{\"outbounds\":[],\"_doft_autostart\":{\"max_unattended_restores\":2}}";
+            AutoStartStore.save(ctx, SLOT, bounded);
+            ctx.state.map.put("vpn_restores", 2);
+            check("an explicit restore bound is honoured",
+                    AutoStartStore.load(ctx, SLOT) == null, "loaded past its bound");
+        }
+
+        // 13d. A blob written by an OLDER build that declares itself non-restorable is
+        //      dropped rather than read: save() refuses to write those now, so its only
+        //      source is a build whose policy no longer applies.
+        {
+            FakeContext ctx = new FakeContext();
+            ctx.prefs.map.put("vpn_schema", 2);
+            ctx.armedAt(System.currentTimeMillis());
+            ctx.prefs.map.put("vpn_config",
+                    "{\"V2RAY_FULL_JSON_CONFIG\":\"{}\",\"TTL_MS\":0}");
+            check("a blob declaring ttl 0 is refused", AutoStartStore.load(ctx, SLOT) == null, "loaded");
+            check("...and dropped", ctx.prefs.map.get("vpn_config") == null, "kept");
         }
 
         // 14. ttl_ms:0 IN THE CORE JSON MEANS "THE APP MUST BE PRESENT FOR THIS SESSION".
@@ -383,7 +416,76 @@ public class AutoStartHarness {
             check("and not outside it", AutoStartStore.load(ctx2, SLOT) == null, "loaded");
         }
 
+        // 15. ⚠ apply() IS ASYNCHRONOUS, AND THE ONE FAILURE THIS BUDGET EXISTS TO BOUND
+        //     IS THE PROCESS DYING. A restored config that takes :RunSoLibV2RayDaemon
+        //     down inside startCore() never lets apply()'s flush thread run, so a charge
+        //     written with apply() was never written at all: count still zero, framework
+        //     restarts the service, same config, forever. The charge is commit()ed.
+        //
+        //     First, prove the FAKE can tell the two apart - otherwise everything below
+        //     passes with either and this whole case is decoration.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            AutoStartStore.beginRestoreAttempt(ctx, SLOT);
+            AutoStartStore.beginRestoreAttempt(ctx, SLOT);
+            ctx.losingApplies();
+            AutoStartStore.noteRestoreSucceeded(ctx, SLOT); // an apply() write, by design
+            check("harness self-test: an unflushed apply() is visible in-process",
+                    ctx.state.getInt("vpn_failures", -1) == 0, "" + ctx.state.getInt("vpn_failures", -1));
+            ctx.processDied();
+            check("harness self-test: and is gone once the process dies",
+                    ctx.state.getInt("vpn_failures", -1) == 2, "" + ctx.state.getInt("vpn_failures", -1));
+        }
+
+        // The charge itself must survive the death it is bounding.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            ctx.losingApplies();
+            check("the attempt is allowed", AutoStartStore.beginRestoreAttempt(ctx, SLOT), "refused");
+            ctx.processDied(); // the restored config killed the process inside startCore()
+            check("the failure charge survived the process death",
+                    ctx.state.getInt("vpn_failures", 0) == 1, "" + ctx.state.getInt("vpn_failures", 0));
+            check("the unattended-restore count survived it too",
+                    ctx.state.getInt("vpn_restores", 0) == 1, "" + ctx.state.getInt("vpn_restores", 0));
+        }
+
+        // ...so a config that kills the process on every start still runs out of budget.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            ctx.losingApplies();
+            for (int i = 0; i < 3; i++) {
+                AutoStartStore.beginRestoreAttempt(ctx, SLOT);
+                ctx.processDied();
+            }
+            check("three process-killing restores exhaust the budget",
+                    !AutoStartStore.beginRestoreAttempt(ctx, SLOT), "a fourth was allowed");
+            ctx.processDied();
+            check("and the config is dropped even though every process died",
+                    ctx.prefs.map.get("vpn_config") == null, "still stored");
+        }
+
+        // 16. clear() IS THE FAIL-CLOSED, so it cannot be a write that might not land: a
+        //     lost flush leaves a credential blob restorable after the user said stop, or
+        //     after another VPN took the slot.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            ctx.losingApplies();
+            AutoStartStore.clear(ctx, SLOT);
+            ctx.processDied(); // the stop raced the framework killing the service
+            check("clear() survives the process death: the credential blob is gone",
+                    ctx.prefs.map.get("vpn_config") == null, "still on disk");
+            check("clear() survives it: the schema key is gone too",
+                    ctx.prefs.map.get("vpn_schema") == null, "still on disk");
+            check("nothing restores after a clear that raced a kill",
+                    AutoStartStore.load(ctx, SLOT) == null, "loaded");
+        }
+
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));
+        System.out.println("RESULT autostart checks=" + checks + " failures=" + failures);
         if (failures != 0) {
             System.exit(1);
         }

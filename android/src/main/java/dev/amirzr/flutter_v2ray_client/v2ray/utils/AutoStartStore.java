@@ -37,35 +37,61 @@ import java.util.ArrayList;
  * buy nothing but a restart loop. No tunnel is always the safe answer here — the caller
  * stops the service.
  *
- * <h3>⚠ THIS IS A SECOND, JAVA-SIDE CONNECT INTENT, AND IT IS BOUNDED FOR THAT REASON</h3>
+ * <h3>⚠ THIS IS A SECOND, JAVA-SIDE CONNECT INTENT — AND WHAT BOUNDS IT IS FAILURE, NOT TIME</h3>
  * The Dart layer keeps its own "should be connected" intent and clears it on events the
  * Java side cannot see — a data-cap cut being the one that matters, because restoring a
  * capped session after an app kill is a free-tier bypass with extra steps. A blob here
- * outlives the app process by design, so it must not be able to outlive the grant that
- * justified it. Two hard bounds, both enforced in {@link #load}:
+ * outlives the app process by design, so something has to bound it.
+ *
+ * <p><b>An earlier revision of this file bounded it with two numbers that were wrong:</b>
+ * eight unattended restores and a seven-day expiry, both counted from the last
+ * app-initiated connect. Consider who actually uses this. Always-on VPN is turned on once,
+ * usually together with the kill switch, by a user whose whole reason for turning it on is
+ * that they never have to think about the app again. Eight reboots — or one week of not
+ * launching an app there is no reason to launch — and the blob was dropped, always-on had
+ * nothing to start, and with the kill switch on that is a phone with NO connectivity at
+ * all until a human opens the app. A bound whose failure mode is "the feature silently
+ * switches itself off for every user who uses it as intended" is worse than the thing it
+ * was bounding.
+ *
+ * <p>The question is not how old the config is. It is which of these two is happening:
  *
  * <ul>
- *   <li><b>An expiry the blob carries.</b> The blob is restorable only for
- *       {@code TTL_MS} after the app-initiated connect that wrote it. The clock is NOT
- *       refreshed by a restore, so the window is absolute: however many times the system
- *       resurrects the session, it stops being resurrectable {@code TTL_MS} after the last
- *       time a human asked for it.</li>
- *   <li><b>A bound on unattended resurrections.</b> {@code MAX_UNATTENDED_RESTORES}
- *       system-initiated restores may run before the config is dropped. This counter is
- *       cleared ONLY by {@link #save} — i.e. by an app-initiated connect — and
- *       deliberately NOT by {@link #noteRestoreSucceeded}, so a healthy restore chain
- *       cannot refill its own budget and run forever with no app process to meter it.</li>
+ *   <li><b>"This config keeps FAILING."</b> Bounded hard, and this is the only bound that
+ *       is on by default: {@link #MAX_CONSECUTIVE_FAILURES} restores that do not produce a
+ *       tunnel and the blob is dropped. The counter is charged BEFORE the attempt and
+ *       committed synchronously (see {@link #beginRestoreAttempt}), and it is cleared ONLY
+ *       by {@link #noteRestoreSucceeded}, which the VPN service calls only with a tun
+ *       interface in hand — never on {@code startCore()} returning true. So a config that
+ *       black-holes, or that starts a core and never gets an interface, or that takes the
+ *       process down with it, ends the loop after three tries whatever the framework
+ *       does.</li>
+ *   <li><b>"This config keeps WORKING and nobody has opened the app."</b> NOT bounded.
+ *       There is no number of successful reboots after which a working tunnel should turn
+ *       itself off, and every candidate number is a date on which somebody's device
+ *       silently loses the network.</li>
  * </ul>
  *
- * <p>Both numbers default conservatively here and can be overridden per connect by the
- * Dart layer, which is the side that knows the entitlement: put a {@code _doft_autostart}
- * object in the core JSON —
- * {@code {"_doft_autostart":{"ttl_ms":3600000,"max_unattended_restores":2}}} — and
- * <b>{@code "ttl_ms":0} means "never restorable"</b>, which is the correct value for a
- * session that is metered against a cap. A config carrying it is not persisted at all and
- * any previously stored one is dropped, so it works as a kill switch even from a cap cut
- * that cannot reach the service.
+ * <p>The metering worry that produced the time bound is real, but a blind timer in this
+ * file is not the instrument for it. The side that knows the entitlement is the Dart side,
+ * and it already has an exact one: put a {@code _doft_autostart} object in the core JSON —
+ * {@code {"_doft_autostart":{"ttl_ms":3600000,"max_unattended_restores":2}}}. Both keys
+ * default to <b>unbounded</b> here and are enforced strictly when present, so a metered or
+ * free-tier connect is expected to carry a finite {@code ttl_ms}, and
+ * <b>{@code "ttl_ms":0} means "never restorable"</b> — a config carrying it is not
+ * persisted at all and any previously stored one is dropped, which makes it a kill switch
+ * even for a cap cut that cannot reach the service.
  *
+ * <p>⚠ NOTHING SETS {@code _doft_autostart} YET: the Dart connect path does not emit the
+ * key, so as shipped an entitled and an unentitled session are bounded identically, by
+ * failure alone. That is the deliberate trade — an unmetered restore of a lapsed session
+ * costs one failed connect, because the node authenticates every reconnect and a lapsed
+ * grant is refused there, whereas the timer's failure mode was a dead device. The
+ * remaining work is in the Dart connect path, not in this file.
+ *
+ * <p>An explicit stop stays absolute and immediate: STOP_SERVICE and {@code onRevoke()}
+ * both {@link #clear} the slot, synchronously, and a cleared slot cannot be restored by
+ * anything.
  * <h3>What is in it</h3>
  * The full core JSON, which on this fork carries the device's TUIC credential in its
  * {@code _doft_tuic} block. It therefore lives in app-private storage and nowhere else,
@@ -75,11 +101,22 @@ import java.util.ArrayList;
  * {@code <data-extraction-rules>} resource; see the note in AndroidManifest.xml.)
  *
  * <h3>Two preference files, on purpose</h3>
- * {@link SharedPreferences#edit()}.apply() rewrites the WHOLE backing XML, so staging a
- * timestamp next to the config blob would rewrite the blob — every reconnect, tens of
- * kilobytes. The blob lives in {@link #PREFS_CONFIG}, which is written only when the
- * config actually changes; the counters and timestamps that change on every start live in
- * {@link #PREFS_STATE}, which is a few dozen bytes.
+ * A {@link SharedPreferences} write rewrites the WHOLE backing XML, so staging a timestamp
+ * next to the config blob would rewrite the blob — every reconnect, tens of kilobytes. The
+ * blob lives in {@link #PREFS_CONFIG}, which is written only when the config actually
+ * changes; the counters and timestamps that change on every start live in
+ * {@link #PREFS_STATE}, which is a few dozen bytes. That split is also what makes the
+ * synchronous {@code commit()} in {@link #beginRestoreAttempt} affordable: the write that
+ * has to land before the attempt runs is against the small file.
+ *
+ * <h3>apply() vs commit(), which is not a style question here</h3>
+ * apply() is asynchronous and its flush is guaranteed only on a NORMAL process exit. Every
+ * write in this class that GRANTS something — a stored config, a cleared failure count —
+ * uses apply(), because losing it fails safe. The two writes that TAKE something away —
+ * charging the restore budget in {@link #beginRestoreAttempt}, and dropping the blob in
+ * {@link #clear} — use commit(), because the exits they have to survive are the abnormal
+ * ones: a restored config that kills the process, and a stop that races the framework
+ * killing the service.
  *
  * <p>Written and read only from the {@code :RunSoLibV2RayDaemon} process (the services
  * live there), so plain single-process {@link SharedPreferences} is the whole story; no
@@ -108,15 +145,34 @@ public final class AutoStartStore {
      */
     private static final int MAX_CONSECUTIVE_FAILURES = 3;
 
-    /**
-     * How many system-initiated restores may run between two app-initiated connects,
-     * successful or not. Bounds a session that the system keeps resurrecting with no app
-     * process behind it — which is a session nothing is metering.
-     */
-    private static final int DEFAULT_MAX_UNATTENDED_RESTORES = 8;
+    /** {@code max_unattended_restores} sentinel: the chain is not counted at all. */
+    private static final int RESTORES_UNBOUNDED = Integer.MAX_VALUE;
 
-    /** How long after the app-initiated connect the blob stays restorable. */
-    private static final long DEFAULT_TTL_MS = 7L * 24L * 60L * 60L * 1000L;
+    /** {@code ttl_ms} sentinel: the blob is not aged at all. */
+    private static final long TTL_NO_EXPIRY = Long.MAX_VALUE;
+
+    /**
+     * How many system-initiated restores may run between two app-initiated connects.
+     *
+     * <p>⚠ UNBOUNDED BY DEFAULT, ON PURPOSE. This counter rises on every restore,
+     * successful or not, and is cleared only by an app-initiated {@link #save}. A finite
+     * default therefore counts REBOOTS OF A WORKING TUNNEL and switches always-on off
+     * after N of them — for the users least likely to ever open the app. A session that
+     * must be metered by an app process says so with
+     * {@code _doft_autostart.max_unattended_restores}; the failure budget above is what
+     * stops a chain that is not working.
+     */
+    private static final int DEFAULT_MAX_UNATTENDED_RESTORES = RESTORES_UNBOUNDED;
+
+    /**
+     * How long after the app-initiated connect the blob stays restorable.
+     *
+     * <p>⚠ NO EXPIRY BY DEFAULT, ON PURPOSE — see the class comment. An expiry here is a
+     * date on which an always-on device silently loses the network, and the grant it was
+     * meant to track is enforced at the node on every reconnect anyway. A session with a
+     * real deadline carries {@code _doft_autostart.ttl_ms}, which IS enforced.
+     */
+    private static final long DEFAULT_TTL_MS = TTL_NO_EXPIRY;
 
     /**
      * A wall clock that reads EARLIER than the moment we saved is a clock that moved, not
@@ -228,7 +284,13 @@ public final class AutoStartStore {
             }
             // The timestamp and the counters are kept OUT of the blob, and out of the
             // blob's preference FILE, so that a reconnect to the same node does not
-            // rewrite it: apply() rewrites the whole XML it is staged against.
+            // rewrite it: a write rewrites the whole XML it is staged against.
+            //
+            // ⚠ apply() HERE IS DELIBERATE, unlike in beginRestoreAttempt()/clear(). This
+            // is the hot connect path (a ~100 KB blob, on the main thread, while the user
+            // is watching the connect), and every way this write can be lost fails SAFE:
+            // no blob means no restore, and a lost counter reset means the budget stays
+            // charged, i.e. errs towards stopping. Nothing here is a permission to run.
             final String blob = o.toString();
             final SharedPreferences cfg = configPrefs(context);
             if (!blob.equals(cfg.getString(keyConfig(slot), null)) || cfg.getInt(keySchema(slot), -1) != SCHEMA) {
@@ -286,31 +348,46 @@ public final class AutoStartStore {
                 return null;
             }
 
-            // ── the two bounds ────────────────────────────────────────────────────────
+            // ── the bounds ────────────────────────────────────────────────────────────
+            // Both are OFF unless the connect that wrote this blob asked for them. The
+            // bound that is always on is the failure budget, and it lives in
+            // beginRestoreAttempt() where the attempt is charged.
             final SharedPreferences st = statePrefs(context);
-            final long savedAt = st.getLong(keySavedAt(slot), 0L);
             final long ttlMs = o.optLong("TTL_MS", DEFAULT_TTL_MS);
-            final long age = System.currentTimeMillis() - savedAt;
-            if (savedAt <= 0L) {
-                Log.w(TAG, "dropping slot " + slot + ": blob has no save time, cannot be aged");
+            if (ttlMs <= 0L) {
+                // save() refuses to persist these, so a blob saying it is not restorable
+                // can only be one written by an older build. Drop it.
+                Log.w(TAG, "dropping slot " + slot + ": blob declares itself non-restorable");
                 clear(context, slot);
                 return null;
             }
-            if (ttlMs <= 0L || age > ttlMs) {
-                Log.w(TAG, "dropping slot " + slot + ": age " + (age / 1000) + "s exceeds ttl "
-                        + (ttlMs / 1000) + "s");
-                clear(context, slot);
-                return null;
-            }
-            if (age < -MAX_CLOCK_SKEW_MS) {
-                Log.w(TAG, "dropping slot " + slot + ": saved " + (-age / 1000)
-                        + "s in the future, the clock moved and the age is meaningless");
-                clear(context, slot);
-                return null;
+            long age = -1L;
+            if (ttlMs != TTL_NO_EXPIRY) {
+                // The connect asked for a deadline, so it gets a strict one: a blob that
+                // cannot be aged is not "young", it is unusable.
+                final long savedAt = st.getLong(keySavedAt(slot), 0L);
+                if (savedAt <= 0L) {
+                    Log.w(TAG, "dropping slot " + slot + ": blob has a ttl but no save time");
+                    clear(context, slot);
+                    return null;
+                }
+                age = System.currentTimeMillis() - savedAt;
+                if (age > ttlMs) {
+                    Log.w(TAG, "dropping slot " + slot + ": age " + (age / 1000) + "s exceeds ttl "
+                            + (ttlMs / 1000) + "s");
+                    clear(context, slot);
+                    return null;
+                }
+                if (age < -MAX_CLOCK_SKEW_MS) {
+                    Log.w(TAG, "dropping slot " + slot + ": saved " + (-age / 1000)
+                            + "s in the future, the clock moved and the age is meaningless");
+                    clear(context, slot);
+                    return null;
+                }
             }
             final int restores = st.getInt(keyRestores(slot), 0);
             final int maxRestores = o.optInt("MAX_UNATTENDED_RESTORES", DEFAULT_MAX_UNATTENDED_RESTORES);
-            if (restores >= maxRestores) {
+            if (maxRestores != RESTORES_UNBOUNDED && restores >= maxRestores) {
                 Log.w(TAG, "dropping slot " + slot + ": " + restores
                         + " system restores since the app last asked for this session");
                 clear(context, slot);
@@ -334,7 +411,9 @@ public final class AutoStartStore {
                     o.optString("APPLICATION_ICON_NAME", ""),
                     o.optInt("APPLICATION_ICON", 0));
             Log.i(TAG, "restored config for slot " + slot + " => " + config.REMARK
-                    + " (age " + (age / 1000) + "s, unattended restores " + restores + "/" + maxRestores + ")");
+                    + " (age " + (age < 0L ? "not tracked" : (age / 1000) + "s")
+                    + ", unattended restores " + restores + "/"
+                    + (maxRestores == RESTORES_UNBOUNDED ? "unbounded" : String.valueOf(maxRestores)) + ")");
             return config;
         } catch (Throwable t) {
             // Unreadable today, unreadable forever. Drop it rather than retry it.
@@ -344,7 +423,19 @@ public final class AutoStartStore {
         }
     }
 
-    /** Forget the tunnel. Called on an explicit stop and when a restore keeps failing. */
+    /**
+     * Forget the tunnel. Called on an explicit stop, on {@code onRevoke()}, and when a
+     * restore keeps failing.
+     *
+     * <p>⚠ {@code commit()}, NOT {@code apply()}. apply() only stages the change in
+     * memory and flushes on a background thread; the flush is guaranteed to complete
+     * before the process exits NORMALLY, and the two callers that matter here are exactly
+     * the abnormal ones — a stop that races the framework killing the service, and the
+     * drop of a config whose own start took the process down. A lost flush leaves a
+     * credential blob restorable after the user said stop, which is the one outcome this
+     * method exists to prevent. The cost is a synchronous write of a few dozen bytes to
+     * two app-private XML files on a path that is already tearing a VPN down.
+     */
     public static void clear(final Context context, final String slot) {
         if (context == null) {
             return;
@@ -353,7 +444,7 @@ public final class AutoStartStore {
             configPrefs(context).edit()
                     .remove(keyConfig(slot))
                     .remove(keySchema(slot))
-                    .apply();
+                    .commit();
         } catch (Throwable t) {
             Log.w(TAG, "could not clear the config for slot " + slot, t);
         }
@@ -362,7 +453,7 @@ public final class AutoStartStore {
                     .remove(keySavedAt(slot))
                     .remove(keyFailures(slot))
                     .remove(keyRestores(slot))
-                    .apply();
+                    .commit();
             Log.i(TAG, "cleared persisted config for slot " + slot);
         } catch (Throwable t) {
             Log.w(TAG, "could not clear the state for slot " + slot, t);
@@ -390,12 +481,26 @@ public final class AutoStartStore {
                 clear(context, slot);
                 return false;
             }
-            // Written BEFORE the attempt: if the attempt takes the process down, the
-            // count still went up.
+            // ⚠ WRITTEN BEFORE THE ATTEMPT, AND WITH commit(), NOT apply().
+            //
+            // apply() is asynchronous: it mutates the in-memory map and hands the disk
+            // write to a background thread, and that write is only guaranteed to have
+            // landed by the time the process exits normally. The single failure this
+            // budget exists to bound is the abnormal exit — a restored config that takes
+            // :RunSoLibV2RayDaemon down inside startCore(). With apply() the flush never
+            // happens, the count never rose, the framework restarts the service, and the
+            // restart loop the budget exists to end runs forever. commit() writes it
+            // synchronously, so the count is on disk before the config gets a chance to
+            // kill anything.
+            //
+            // This is a main-thread disk write (onStartCommand), which StrictMode will
+            // flag: it is a few dozen bytes into the SMALL preferences file — the blob
+            // lives in the other one precisely so this write stays cheap — and it is the
+            // only thing standing between a bad config and an unbounded restart loop.
             p.edit()
                     .putInt(keyFailures(slot), failures + 1)
                     .putInt(keyRestores(slot), p.getInt(keyRestores(slot), 0) + 1)
-                    .apply();
+                    .commit();
             return true;
         } catch (Throwable t) {
             Log.w(TAG, "could not read the restore budget for slot " + slot, t);
@@ -419,6 +524,9 @@ public final class AutoStartStore {
             return;
         }
         try {
+            // apply() is right here: losing this write leaves the attempt charged, which
+            // errs towards dropping the config. The writes that must not be lost are the
+            // ones that GRANT nothing — the charge and the clear — and those commit().
             statePrefs(context).edit().putInt(keyFailures(slot), 0).apply();
         } catch (Throwable t) {
             Log.w(TAG, "could not reset the restore budget for slot " + slot, t);

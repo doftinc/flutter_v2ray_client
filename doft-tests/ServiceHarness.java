@@ -42,6 +42,8 @@ import java.util.Map;
 public class ServiceHarness {
 
     static int failures = 0;
+    /** counted at runtime so the suite total cannot be hand-typed wrong */
+    static int checks = 0;
 
     /**
      * Run one case. ⚠ A CASE THAT THROWS IS A FAILED CASE, NOT A FAILED RUN: the pre-fix
@@ -52,12 +54,15 @@ public class ServiceHarness {
         try {
             body.run();
         } catch (Throwable t) {
+            checks++;
             failures++;
             System.out.printf("%-58s %s  %s%n", "(case threw)", "FAIL", t);
+            t.printStackTrace();
         }
     }
 
     static void check(String name, boolean ok, String detail) {
+        checks++;
         if (!ok) {
             failures++;
         }
@@ -67,61 +72,43 @@ public class ServiceHarness {
 
     // ── fakes ────────────────────────────────────────────────────────────────────────
 
-    static class Prefs implements SharedPreferences {
-        final Map<String, Object> map = new HashMap<>();
-        /** every apply() rewrites the whole XML on a device; this counts them. */
-        int applies = 0;
-
-        public String getString(String k, String def) {
-            Object v = map.get(k);
-            return v instanceof String ? (String) v : def;
-        }
-
-        public int getInt(String k, int def) {
-            Object v = map.get(k);
-            return v instanceof Integer ? (Integer) v : def;
-        }
-
-        public long getLong(String k, long def) {
-            Object v = map.get(k);
-            return v instanceof Long ? (Long) v : def;
-        }
-
-        public Editor edit() {
-            final Map<String, Object> staged = new HashMap<>();
-            final ArrayList<String> removed = new ArrayList<>();
-            return new Editor() {
-                public Editor putString(String k, String v) { staged.put(k, v); return this; }
-                public Editor putInt(String k, int v) { staged.put(k, v); return this; }
-                public Editor putLong(String k, long v) { staged.put(k, v); return this; }
-                public Editor remove(String k) { removed.add(k); return this; }
-                public void apply() {
-                    applies++;
-                    for (String k : removed) {
-                        map.remove(k);
-                    }
-                    map.putAll(staged);
-                }
-            };
-        }
-    }
+    /**
+     * ⚠ THE FAKE IS LosablePrefs, WHOSE apply() CAN BE LOST. A fake whose apply() lands
+     * synchronously cannot distinguish apply() from commit(), so it green-lights a budget
+     * that is never written before the crash it is bounding.
+     */
 
     /** The on-disk state a killed process leaves behind: survives the service instance. */
     static class Disk {
-        final Map<String, Prefs> files = new HashMap<>();
+        final Map<String, LosablePrefs> files = new HashMap<>();
 
-        Prefs file(String name) {
-            Prefs p = files.get(name);
+        LosablePrefs file(String name) {
+            LosablePrefs p = files.get(name);
             if (p == null) {
-                p = new Prefs();
+                p = new LosablePrefs();
                 files.put(name, p);
             }
             return p;
         }
 
-        Prefs config() { return file("doft_v2ray_autostart"); }
+        LosablePrefs config() { return file("doft_v2ray_autostart"); }
 
-        Prefs state() { return file("doft_v2ray_autostart_state"); }
+        LosablePrefs state() { return file("doft_v2ray_autostart_state"); }
+
+        /** from here on, an apply() stages in memory and never reaches the disk */
+        Disk losingApplies() {
+            for (LosablePrefs p : files.values()) {
+                p.dropUnflushedApplies = true;
+            }
+            return this;
+        }
+
+        /** Android killed :RunSoLibV2RayDaemon; unflushed apply()s are gone with it. */
+        void processDied() {
+            for (LosablePrefs p : files.values()) {
+                p.processDied();
+            }
+        }
 
         boolean hasVpnBlob() { return config().map.get("vpn_config") != null; }
 
@@ -230,8 +217,15 @@ public class ServiceHarness {
             userStart(new TestVpn(disk), config(null));
             check("armed: a user start persists the config", disk.hasVpnBlob(), "nothing stored");
 
+            // A fresh process starts with the static back at its default; set it to the
+            // WRONG value so that "the restore re-asserts it" is an assertion and not a
+            // coincidence. showNotification() reads it to aim the stop button.
+            AppConfigs.V2RAY_CONNECTION_MODE = AppConfigs.V2RAY_CONNECTION_MODES.PROXY_ONLY;
             TestVpn restarted = new TestVpn(disk);
             int r = stickyRestart(restarted);
+            check("sticky restart aims the notification at the VPN service",
+                    AppConfigs.V2RAY_CONNECTION_MODE == AppConfigs.V2RAY_CONNECTION_MODES.VPN_TUN,
+                    "" + AppConfigs.V2RAY_CONNECTION_MODE);
             check("sticky restart (null intent) returns START_STICKY",
                     r == android.app.Service.START_STICKY, "returned " + r);
             check("sticky restart starts the core again",
@@ -420,19 +414,21 @@ public class ServiceHarness {
                     "blob " + disk.hasVpnBlob() + ", restores " + disk.vpnRestores());
         });
 
-        // 11. AN EXPIRY THE BLOB CARRIES. A session killed before a data cap was hit must
-        //     not be restorable indefinitely with no app process to meter it.
+        // 11. AN EXPIRY THE BLOB CARRIES - WHEN THE CONNECT ASKED FOR ONE. A session that
+        //     an app process has to meter (free tier, trial, anything counted against a
+        //     cap) is connected with a finite `_doft_autostart.ttl_ms`, and the service
+        //     must refuse it once it is past. ⚠ There is NO default expiry any more; case
+        //     19 is why. The bound that is always on is failure, not age.
         run(() -> {
             resetWorld();
             Disk disk = new Disk();
-            userStart(new TestVpn(disk), config(null));
-            // eight days later, on a device that has not run the app since
-            disk.state().map.put("vpn_saved_at",
-                    System.currentTimeMillis() - 8L * 24L * 60L * 60L * 1000L);
+            userStart(new TestVpn(disk), config("{\"ttl_ms\":3600000}"));
+            // an hour and a second later, on a device that has not run the app since
+            disk.state().map.put("vpn_saved_at", System.currentTimeMillis() - 3_601_000L);
             int r = stickyRestart(new TestVpn(disk));
-            check("a blob past its TTL does not restore", r == android.app.Service.START_NOT_STICKY,
-                    "returned " + r);
-            check("a blob past its TTL is dropped", !disk.hasVpnBlob(), "still stored");
+            check("a metered blob past its ttl does not restore",
+                    r == android.app.Service.START_NOT_STICKY, "returned " + r);
+            check("a metered blob past its ttl is dropped", !disk.hasVpnBlob(), "still stored");
         });
 
         // 12. ttl_ms:0 IS A KILL SWITCH THE DART SIDE CAN SET AT CONNECT TIME, for a
@@ -485,6 +481,13 @@ public class ServiceHarness {
                     r == android.app.Service.START_STICKY, "returned " + r);
             check("proxy: sticky restart starts the core",
                     V2rayCoreManager.startCoreCalls == 2, "" + V2rayCoreManager.startCoreCalls);
+            // ⚠ resetWorld() left this at VPN_TUN, which is what a fresh process has. If
+            // the proxy restore does not re-assert PROXY_ONLY, showNotification() aims the
+            // notification's stop button at V2rayVPNService - a button that stops nothing,
+            // on the only notification the user has.
+            check("proxy: the restore aims the notification's stop button at the proxy",
+                    AppConfigs.V2RAY_CONNECTION_MODE == AppConfigs.V2RAY_CONNECTION_MODES.PROXY_ONLY,
+                    "" + AppConfigs.V2RAY_CONNECTION_MODE);
         });
 
         // 15. ⚠ THE PROXY HAS NO TUN TO POINT AT, so it has NO evidence that a restore
@@ -515,7 +518,169 @@ public class ServiceHarness {
             check("proxy: the config is dropped", !disk.hasProxyBlob(), "still stored");
         });
 
+        // 16. ⚠ onRevoke() IS THE OTHER WAY THE USER SAYS NO, and it had no test at all:
+        //     deleting its AutoStartStore.clear() left this whole suite green. The
+        //     framework calls it when VPN consent is revoked in Settings or when another
+        //     app takes the VPN slot. That is the tunnel being turned off by someone, so
+        //     the credential blob must go with it - otherwise the next sticky restart or
+        //     always-on start puts back the tunnel the user just took away.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+            check("armed before the revoke", disk.hasVpnBlob(), "nothing stored");
+
+            s.onRevoke();
+            check("onRevoke drops the credential-bearing blob", !disk.hasVpnBlob(), "still stored");
+            check("onRevoke stops the core", !V2rayCoreManager.coreRunning, "core still running");
+            check("onRevoke stops the service for real", s.stopSelfCalled, "service left alive");
+
+            int r = stickyRestart(new TestVpn(disk));
+            check("nothing restores after a revoke", r == android.app.Service.START_NOT_STICKY,
+                    "returned " + r);
+            check("and the core was not started again", V2rayCoreManager.startCoreCalls == 1,
+                    "" + V2rayCoreManager.startCoreCalls);
+        });
+
+        // 17. ⚠ CONSENT CAN BE LOST BETWEEN onStartCommand AND setup(). restoreLastKnownGood()
+        //     checks prepare() before it starts the core, but setup() runs later, from
+        //     xray's startup() callback - by which time another VPN may hold the slot.
+        //     setup()'s prepare() branch used to be a BARE RETURN, which leaves a core
+        //     that is already running with no tun to put its traffic in. Reverting it to
+        //     a bare return leaves the suite green unless this case exists.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            userStart(new TestVpn(disk), config(null));
+
+            TestVpn s = new TestVpn(disk);
+            stickyRestart(s);                                   // consent was granted here
+            check("the restore started the core", V2rayCoreManager.coreRunning, "core not running");
+            VpnService.prepareResult = new Intent("consent");    // another VPN takes the slot
+            int establishBefore = VpnService.establishCalls;
+
+            s.startService();                                   // the startup() callback
+            check("consent lost before setup(): no tun is attempted",
+                    VpnService.establishCalls == establishBefore,
+                    "establish calls " + establishBefore + " -> " + VpnService.establishCalls);
+            check("consent lost before setup(): the core is stopped, not left running",
+                    !V2rayCoreManager.coreRunning, "a core is running with no tun");
+            check("consent lost before setup(): the service is stopped for real",
+                    s.stopSelfCalled, "service left alive");
+            check("consent lost before setup(): the attempt stays charged",
+                    disk.vpnFailures() == 1, "failures " + disk.vpnFailures());
+        });
+
+        // 18. sendFileDescriptor() WITH NO INTERFACE. The tun2socks watcher thread
+        //     re-enters runTun2socks() when the binary exits, and stopAllProcess() may
+        //     already have closed and nulled the interface by then. This used to be an
+        //     NPE, swallowed by runTun2socks' own catch, which then hand-called
+        //     onDestroy() - cleanup without a stop, on a service that had returned
+        //     START_STICKY. It is invoked directly here because the race cannot be
+        //     scheduled deterministically from outside the class.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            s.onCreate();
+            boolean threw = false;
+            try {
+                java.lang.reflect.Method m =
+                        V2rayVPNService.class.getDeclaredMethod("sendFileDescriptor");
+                m.setAccessible(true);
+                m.invoke(s); // mInterface is null: setup() never ran
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                threw = true;
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            check("sendFileDescriptor with no tun interface does not throw", !threw,
+                    "it threw, so runTun2socks would hand-call onDestroy()");
+        });
+
+        // 19. ⚠ ALWAYS-ON IS THE FEATURE WHOSE USERS NEVER OPEN THE APP. An earlier
+        //     revision bounded the restore chain at 8 unattended restores and a 7-day
+        //     expiry, both counted from the last app-initiated connect - so a phone with
+        //     always-on and the kill switch on lost the network entirely a week later,
+        //     until somebody launched an app they had no reason to launch. Failure is
+        //     bounded (cases 9 and 15); success is not.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            userStart(new TestVpn(disk), config(null));
+            // the app has not been opened since; the clock says over a year
+            disk.state().map.put("vpn_saved_at",
+                    System.currentTimeMillis() - 400L * 24L * 60L * 60L * 1000L);
+
+            int last = 0;
+            for (int i = 0; i < 30; i++) {
+                TestVpn s = new TestVpn(disk);
+                last = stickyRestart(s);
+                VpnService.establishResult = new ParcelFileDescriptor();
+                s.startService();                       // a real tun every time
+            }
+            check("30 reboots over a year with the app never opened still restore",
+                    last == android.app.Service.START_STICKY, "returned " + last);
+            check("...and the config is still there for the next boot", disk.hasVpnBlob(),
+                    "always-on switched itself off");
+            check("...having counted every one of them", disk.vpnRestores() == 30,
+                    "restores " + disk.vpnRestores());
+        });
+
+        // 20. AND THE FAILING CHAIN STILL DIES, EVEN WHEN EVERY ATTEMPT KILLS THE PROCESS
+        //     BEFORE AN apply() COULD FLUSH. This is the pairing for case 19: what bounds
+        //     the loop is failure, so failure has to be recorded durably.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            userStart(new TestVpn(disk), config(null));
+            disk.losingApplies();
+            int last = 0;
+            for (int i = 0; i < 3; i++) {
+                TestVpn s = new TestVpn(disk);
+                last = stickyRestart(s);
+                disk.processDied();   // the config took :RunSoLibV2RayDaemon down with it
+            }
+            check("three process-killing restores are allowed",
+                    last == android.app.Service.START_STICKY, "returned " + last);
+            TestVpn fourth = new TestVpn(disk);
+            int r = stickyRestart(fourth);
+            disk.processDied();
+            check("the fourth is refused even though no apply() ever flushed",
+                    r == android.app.Service.START_NOT_STICKY, "returned " + r);
+            check("and the blob is gone from disk, not just from memory",
+                    !disk.hasVpnBlob(), "still stored");
+        });
+
+        // 21. ⚠ THE STOP PATH RE-ENTERS THE SERVICE, and the stub used to hide that. The
+        //     real V2rayCoreManager.stopCore() ends in v2rayServicesListener.stopService(),
+        //     and V2rayVPNService.stopService() IS stopAllProcess(), which calls stopCore()
+        //     - so every "the core is stopped" assertion in this file runs through a cycle.
+        //     It terminates for one reason: stopLoop() clears the running flag before the
+        //     callback, so the second stopCore() takes the "not running" branch. The stub
+        //     models that exactly; these numbers are what pins it.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+            V2rayCoreManager.stopCoreCalls = 0;
+            V2rayCoreManager.stopServiceCallbacks = 0;
+
+            s.stopService(); // == stopAllProcess(), what the core calls back into
+
+            check("stopping re-enters the service exactly once",
+                    V2rayCoreManager.stopServiceCallbacks == 1,
+                    "callbacks " + V2rayCoreManager.stopServiceCallbacks);
+            check("the stop cycle is two deep and terminates",
+                    V2rayCoreManager.stopCoreCalls == 2, "stopCore calls " + V2rayCoreManager.stopCoreCalls);
+            check("the core ends up stopped", !V2rayCoreManager.coreRunning, "still running");
+            check("the service ends up stopped", s.stopSelfCalled, "still alive");
+        });
+
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));
+        System.out.println("RESULT services checks=" + checks + " failures=" + failures);
         if (failures != 0) {
             System.exit(1);
         }

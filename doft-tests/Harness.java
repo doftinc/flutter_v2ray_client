@@ -5,6 +5,8 @@ import java.util.ArrayList;
 /** Runs the REAL parseV2rayJsonFile against the four outbound shapes this fleet emits. */
 public class Harness {
     static int failures = 0;
+    /** counted at runtime so the suite total cannot be hand-typed wrong */
+    static int checks = 0;
 
     static String cfg(String outbound) {
         return "{\"inbounds\":[{\"protocol\":\"socks\",\"port\":10808},"
@@ -17,6 +19,7 @@ public class Harness {
         String got = (c == null) ? "<null>" : c.CONNECTED_V2RAY_SERVER_ADDRESS + ":" + c.CONNECTED_V2RAY_SERVER_PORT;
         String want = (wantAddr == null) ? "<null>" : wantAddr + ":" + wantPort;
         boolean ok = got.equals(want);
+        checks++;
         if (!ok) failures++;
         System.out.printf("%-28s %s  got=%s want=%s%n", name, ok ? "PASS" : "FAIL", got, want);
     }
@@ -52,6 +55,7 @@ public class Harness {
         // No endpoint anywhere must still be null — but now a LOGGED null.
         expect("no endpoint at all", "{\"tag\":\"proxy\",\"protocol\":\"freedom\"}", null, null);
         System.out.println(failures == 0 ? "\nALL PASS" : "\n" + failures + " FAILURE(S)");
+        System.out.println("RESULT endpoints checks=" + checks + " failures=" + failures);
         System.exit(failures == 0 ? 0 : 1);
     }
 }

@@ -7,8 +7,11 @@ import org.json.JSONObject;
 /** Runs the REAL rewriteTuicOutbounds against the shapes the Dart side emits. */
 public class TuicRewriteHarness {
     static int failures = 0;
+    /** counted at runtime so the suite total cannot be hand-typed wrong */
+    static int checks = 0;
 
     static void check(String name, boolean ok, String detail) {
+        checks++;
         if (!ok) failures++;
         System.out.printf("%-52s %s  %s%n", name, ok ? "PASS" : "FAIL", detail);
     }
@@ -90,6 +93,7 @@ public class TuicRewriteHarness {
         check("unrelated outbounds untouched", o.length() == 3, "len=" + o.length());
 
         System.out.println(failures == 0 ? "\nALL PASS" : "\n" + failures + " FAILURE(S)");
+        System.out.println("RESULT tuic checks=" + checks + " failures=" + failures);
         System.exit(failures == 0 ? 0 : 1);
     }
 }

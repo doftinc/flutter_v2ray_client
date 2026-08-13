@@ -44,3 +44,18 @@ javac -nowarn -cp "$JSON_JAR" -d build/tclasses \
   "$SRC/core/TuicConfigRewriter.java"
 java -cp "build/tclasses:$JSON_JAR" \
   dev.amirzr.flutter_v2ray_client.v2ray.core.TuicRewriteHarness
+
+# ── autostart store ───────────────────────────────────────────────────────────────
+# ⚠ THE ONE THAT DECIDES WHAT A START WE DID NOT MAKE DOES. Android hands a sticky
+# restart a NULL intent and hands an always-on start a bare action intent; neither can
+# carry a config, so the services read it from here. It runs when there may be no app
+# process at all, which is why every unreadable, stale or foreign blob below must end in
+# NO TUNNEL and NO EXCEPTION rather than in a restart loop — and why the blob is named
+# JSON instead of a serialized V2rayConfig, whose readObject() would throw on the first
+# start after any app update that touched the class.
+echo
+javac -nowarn -cp "$JSON_JAR" -d build/aclasses \
+  AutoStartHarness.java \
+  $(find stubs -name '*.java') \
+  "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java"
+java -cp "build/aclasses:$JSON_JAR" AutoStartHarness

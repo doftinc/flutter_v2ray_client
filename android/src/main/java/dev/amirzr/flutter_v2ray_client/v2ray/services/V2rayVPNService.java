@@ -12,6 +12,7 @@ import android.util.Log;
 import dev.amirzr.flutter_v2ray_client.v2ray.core.V2rayCoreManager;
 import dev.amirzr.flutter_v2ray_client.v2ray.interfaces.V2rayServicesListener;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.AppConfigs;
+import dev.amirzr.flutter_v2ray_client.v2ray.utils.AutoStartStore;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.V2rayConfig;
 
 import org.json.JSONArray;
@@ -25,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 
 public class V2rayVPNService extends VpnService implements V2rayServicesListener {
+    private static final String TAG = "V2rayVPNService";
     private ParcelFileDescriptor mInterface;
     private Process process;
     private V2rayConfig v2rayConfig;
@@ -38,43 +40,58 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // Handle null intent case - can happen when service is restarted by system
-        if (intent == null) {
-            Log.w("V2rayVPNService", "onStartCommand called with null intent, stopping service");
-            this.onDestroy();
-            return START_NOT_STICKY;
+        AppConfigs.V2RAY_SERVICE_COMMANDS startCommand = null;
+        if (intent != null) {
+            try {
+                startCommand = (AppConfigs.V2RAY_SERVICE_COMMANDS) intent.getSerializableExtra("COMMAND");
+            } catch (Throwable t) {
+                // A foreign or unreadable extra is a start we do not understand, not a
+                // reason to take the process down.
+                Log.w(TAG, "COMMAND extra could not be read", t);
+            }
         }
 
-        AppConfigs.V2RAY_SERVICE_COMMANDS startCommand = (AppConfigs.V2RAY_SERVICE_COMMANDS) intent
-                .getSerializableExtra("COMMAND");
-
-        // Handle null command case
         if (startCommand == null) {
-            Log.w("V2rayVPNService", "No command found in intent, stopping service");
-            this.onDestroy();
-            return START_NOT_STICKY;
+            // TWO SYSTEM-INITIATED STARTS LAND HERE AND NEITHER CAN CARRY OUR EXTRAS.
+            //  * The START_STICKY restart after the process was killed: Android
+            //    redelivers a NULL intent. This branch used to answer it with
+            //    onDestroy() + START_NOT_STICKY, which is why the START_STICKY returned
+            //    at the bottom of this method has never once brought a tunnel back.
+            //  * Always-on VPN: the manifest declares SUPPORTS_ALWAYS_ON plus the
+            //    android.net.VpnService intent-filter, and our kill switch sends the user
+            //    to that OS setting. The framework then starts this service with a bare
+            //    action intent - no COMMAND, no V2RAY_CONFIG - so the user turned on the
+            //    setting we asked for and got an instantly destroyed service.
+            // Both mean "the tunnel should be up". Answer them from the last config that
+            // actually started, and only from that.
+            return restoreLastKnownGood(intent == null
+                    ? "sticky restart (null intent)"
+                    : "start with no COMMAND extra (always-on VPN)");
         }
 
         if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE)) {
             v2rayConfig = (V2rayConfig) intent.getSerializableExtra("V2RAY_CONFIG");
             if (v2rayConfig == null) {
-                Log.w("V2rayVPNService", "V2RAY_CONFIG is null, cannot start service");
-                this.onDestroy();
-                return START_NOT_STICKY;
+                return stopCleanly("V2RAY_CONFIG is null, cannot start service");
             }
             if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
                 V2rayCoreManager.getInstance().stopCore();
             }
             if (V2rayCoreManager.getInstance().startCore(v2rayConfig)) {
-                Log.i("V2rayVPNService", "onStartCommand success => v2ray core started.");
+                Log.i(TAG, "onStartCommand success => v2ray core started.");
+                // ONLY HERE, AFTER THE CORE IS ACTUALLY UP. This blob is what a
+                // system-initiated start replays; a config that never started must never
+                // be replayed.
+                AutoStartStore.save(this, AutoStartStore.SLOT_VPN, v2rayConfig);
             } else {
-                Log.e("V2rayVPNService", "Failed to start v2ray core");
-                this.onDestroy();
-                return START_NOT_STICKY;
+                return stopCleanly("failed to start v2ray core");
             }
         } else if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE)) {
             V2rayCoreManager.getInstance().stopCore();
             AppConfigs.V2RAY_CONFIG = null;
+            // The user turned the tunnel off. Nothing may bring it back: not a sticky
+            // restart, not always-on.
+            AutoStartStore.clear(this, AutoStartStore.SLOT_VPN);
         } else if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.MEASURE_DELAY)) {
             new Thread(() -> {
                 try {
@@ -88,11 +105,101 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
                 }
             }, "MEASURE_CONNECTED_V2RAY_SERVER_DELAY").start();
         } else {
-            Log.w("V2rayVPNService", "Unknown command received, stopping service");
-            this.onDestroy();
-            return START_NOT_STICKY;
+            return stopCleanly("unknown command received");
         }
         return START_STICKY;
+    }
+
+    /**
+     * Bring the tunnel back from the last config that started the core, for a start the
+     * system made (sticky restart or always-on). Any doubt at all and the service stops:
+     * a VPN service that is up without a tunnel is worse than one that is down.
+     */
+    private int restoreLastKnownGood(final String reason) {
+        Log.i(TAG, "system-initiated start => " + reason);
+
+        // Idempotent. The framework re-sends the always-on start intent, and tearing a
+        // healthy tunnel down to rebuild it would be a self-inflicted outage.
+        if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
+            Log.i(TAG, "core is already running, nothing to restore");
+            return START_STICKY;
+        }
+
+        final V2rayConfig restored = AutoStartStore.load(this, AutoStartStore.SLOT_VPN);
+        if (restored == null) {
+            // Either the user stopped the tunnel (we cleared the store) or the blob could
+            // not be read back (load() dropped it). Nothing to start: fail closed.
+            return stopCleanly("no usable persisted config");
+        }
+
+        // ⚠ prepare() NON-NULL MEANS "ASK THE USER", AND THERE IS NOBODY TO ASK. There is
+        // no Activity on a system-initiated start, so the consent intent cannot be
+        // launched; and starting the core without an established tun interface would put
+        // the traffic on the wire outside the tunnel. Stop, cleanly, once.
+        try {
+            if (VpnService.prepare(this) != null) {
+                return stopCleanly("VPN consent not granted and no Activity to ask with");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "VpnService.prepare failed", t);
+            return stopCleanly("VpnService.prepare failed");
+        }
+
+        // A config that fails to start fails the same way every time, and always-on is
+        // retried by the framework whatever we return. Spend the budget, then give up.
+        if (!AutoStartStore.beginRestoreAttempt(this, AutoStartStore.SLOT_VPN)) {
+            return stopCleanly("restore budget spent, persisted config dropped");
+        }
+
+        v2rayConfig = restored;
+        // This process starts fresh on a sticky restart, so the static is back at its
+        // default; showNotification() reads it to aim the notification's stop button.
+        AppConfigs.V2RAY_CONNECTION_MODE = AppConfigs.V2RAY_CONNECTION_MODES.VPN_TUN;
+
+        // ⚠ startCore() -> showNotification() -> startForeground() is the ONLY
+        // startForeground() call on this path, exactly as on the user-initiated one. Do
+        // not add a notification-permission check in front of it (6205a88): skipping
+        // startForeground() misses the foreground-service deadline and the OS kills the
+        // process outright.
+        if (!V2rayCoreManager.getInstance().startCore(restored)) {
+            return stopCleanly("restored config did not start the core");
+        }
+        // ⚠ The failure budget is NOT cleared here. startCore() returning true means the
+        // core loop started, not that a tunnel exists - setup() still has to establish
+        // the tun, and it can fail. The budget is cleared in setup(), once there is a
+        // real interface; otherwise a config that starts a core and then dies would keep
+        // resetting its own budget and loop forever.
+        Log.i(TAG, "tunnel restored from persisted config => " + restored.REMARK);
+        // NOTHING IS SENT TO DART HERE, ON PURPOSE. The app process may not exist - that
+        // is the whole point of this path - and the only channel that exists is the
+        // per-second V2RAY_CONNECTION_INFO broadcast the core already sends, which is
+        // delivered to a RUNTIME-registered receiver (V2rayController.init). With no app
+        // process there is nobody registered and the broadcast is a no-op; once the app
+        // runs again it registers and picks the state up on the next tick, which is the
+        // same reconciliation it already does on resume. Waking the app from here would
+        // mean a manifest receiver that launches a process the user did not ask for.
+        return START_STICKY;
+    }
+
+    /**
+     * Stop for real. The old code called onDestroy() by hand, which runs the cleanup but
+     * does NOT stop the service: the service stayed alive with no core and, when it had
+     * been launched with startForegroundService(), no startForeground() either - which is
+     * the shape the OS kills with ForegroundServiceDidNotStartInTimeException.
+     */
+    private int stopCleanly(final String why) {
+        Log.w(TAG, "stopping service => " + why);
+        try {
+            stopForeground(true);
+        } catch (Exception e) {
+            Log.w(TAG, "stopForeground failed", e);
+        }
+        try {
+            stopSelf();
+        } catch (Exception e) {
+            Log.w(TAG, "stopSelf failed", e);
+        }
+        return START_NOT_STICKY;
     }
 
     private void stopAllProcess() {
@@ -192,6 +299,11 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         try {
             mInterface = builder.establish();
             isRunning = true;
+            // A tun interface exists, so whatever config produced it is known-good: this
+            // is the only place the restore budget may be cleared (see
+            // restoreLastKnownGood). Harmless on the user-initiated path, where save()
+            // has already cleared it.
+            AutoStartStore.noteRestoreSucceeded(this, AutoStartStore.SLOT_VPN);
             runTun2socks();
         } catch (Exception e) {
             Log.e("VPN_SERVICE", "Failed to establish VPN interface", e);
@@ -310,6 +422,9 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
 
     @Override
     public void onRevoke() {
+        // The user revoked our VPN consent, or another app took the VPN slot. That is the
+        // user turning the tunnel off, so it must not come back on a system start.
+        AutoStartStore.clear(this, AutoStartStore.SLOT_VPN);
         stopAllProcess();
     }
 

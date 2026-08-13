@@ -109,7 +109,15 @@ public class V2rayProxyOnlyService extends Service implements V2rayServicesListe
         if (!V2rayCoreManager.getInstance().startCore(restored)) {
             return stopCleanly("restored config did not start the core");
         }
-        AutoStartStore.noteRestoreSucceeded(this, AutoStartStore.SLOT_PROXY);
+        // ⚠ THE FAILURE BUDGET IS NOT CLEARED HERE, and there is nothing on this path
+        // that may clear it. startCore() returning true only means startLoop() did not
+        // throw; V2rayVPNService can do better because it has a tun interface to point
+        // at, and this service has no equivalent evidence at all. Clearing the budget on
+        // startCore() alone would let a config that starts a core and then does nothing
+        // reset its own budget on every restart, which is exactly the loop the budget
+        // exists to end. The budget is refilled by AutoStartStore.save(), i.e. by an
+        // app-initiated connect - so the system may resurrect this proxy at most
+        // MAX_CONSECUTIVE_FAILURES times before a human has to ask for it again.
         Log.i(TAG, "proxy restored from persisted config => " + restored.REMARK);
         return START_STICKY;
     }

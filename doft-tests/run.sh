@@ -24,7 +24,7 @@ mkdir -p build
 if [ ! -s "$JSON_JAR" ]; then
   curl -sSL -o "$JSON_JAR" https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
 fi
-rm -rf build/classes && mkdir -p build/classes
+rm -rf build/classes build/tclasses build/aclasses build/sclasses && mkdir -p build/classes
 javac -nowarn -cp "$JSON_JAR" -d build/classes \
   Harness.java \
   $(find stubs -name '*.java') \
@@ -59,3 +59,21 @@ javac -nowarn -cp "$JSON_JAR" -d build/aclasses \
   $(find stubs -name '*.java') \
   "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java"
 java -cp "build/aclasses:$JSON_JAR" AutoStartHarness
+
+# ── the two services themselves ───────────────────────────────────────────────────
+# ⚠ THE PREVIOUS ROUND SHIPPED THESE WITH NO TEST OVER THEM. Reverting both service
+# files to 84424a2 left every assertion above green, because they only ever exercised the
+# key-value store underneath. These compile and run the REAL V2rayVPNService and
+# V2rayProxyOnlyService against stubbed Android, and each case names a state the shipped
+# code could reach and must not: a null intent answered with suicide, an always-on start
+# answered the same way, a NULL return from builder.establish() treated as a working
+# tunnel, and `this.onDestroy()` used as a stop (it cleans up and leaves the service
+# alive). Reverting either service file turns this run red.
+echo
+javac -nowarn -cp "$JSON_JAR" -d build/sclasses \
+  ServiceHarness.java \
+  $(find stubs -name '*.java') \
+  "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" "$SRC/utils/AppConfigs.java" \
+  "$SRC/interfaces/V2rayServicesListener.java" \
+  "$SRC/services/V2rayVPNService.java" "$SRC/services/V2rayProxyOnlyService.java"
+java -cp "build/sclasses:$JSON_JAR" ServiceHarness

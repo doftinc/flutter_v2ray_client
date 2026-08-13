@@ -37,6 +37,11 @@ public class AutoStartHarness {
     /** A working in-memory SharedPreferences: the round trip is real, not mocked out. */
     static class FakePrefs implements SharedPreferences {
         final Map<String, Object> map = new HashMap<>();
+        /** ⚠ THE NUMBER THAT MATTERS. apply() rewrites the WHOLE backing XML, so an
+         *  apply() against the file holding the ~100 KB blob rewrites the blob - which is
+         *  why the timestamps and counters live in a different file. Counting a staged
+         *  key would have measured an in-memory flag, not a write. */
+        int applies = 0;
         int writes = 0;
 
         public String getString(String k, String def) {
@@ -63,6 +68,7 @@ public class AutoStartHarness {
                 public Editor putLong(String k, long v) { staged.put(k, v); return this; }
                 public Editor remove(String k) { removed.add(k); return this; }
                 public void apply() {
+                    applies++;
                     for (String k : removed) {
                         map.remove(k);
                     }
@@ -98,12 +104,25 @@ public class AutoStartHarness {
     }
 
     static class FakeContext extends Context {
+        /** the rarely-written file: the config blob and its schema */
         final FakePrefs prefs = new FakePrefs();
+        /** the always-written file: timestamps and counters, a few dozen bytes */
+        final FakePrefs state = new FakePrefs();
         final Resources res = new FakeResources();
 
         public Context getApplicationContext() { return this; }
-        public SharedPreferences getSharedPreferences(String name, int mode) { return prefs; }
+
+        public SharedPreferences getSharedPreferences(String name, int mode) {
+            return "doft_v2ray_autostart_state".equals(name) ? state : prefs;
+        }
+
         public Resources getResources() { return res; }
+
+        /** A blob injected by hand still needs the save time load() ages it against. */
+        FakeContext armedAt(long millis) {
+            state.map.put("vpn_saved_at", millis);
+            return this;
+        }
     }
 
     static V2rayConfig sample() {
@@ -151,11 +170,16 @@ public class AutoStartHarness {
                         "" + out.APPLICATION_ICON);
             }
 
-            // 2. an identical re-save must not rewrite ~100 KB of prefs
-            int before = ctx.prefs.writes;
+            // 2. an identical re-save must not rewrite ~100 KB of prefs. Measured as
+            //    apply() calls against the FILE the blob lives in, because that is what a
+            //    rewrite is; the counters go to the other file.
+            int before = ctx.prefs.applies;
+            int stateBefore = ctx.state.applies;
             AutoStartStore.save(ctx, SLOT, sample());
-            check("identical re-save does not rewrite the blob", ctx.prefs.writes == before,
-                    "writes " + before + " -> " + ctx.prefs.writes);
+            check("identical re-save does not rewrite the blob file", ctx.prefs.applies == before,
+                    "applies " + before + " -> " + ctx.prefs.applies);
+            check("the timestamp still lands, in the small file", ctx.state.applies > stateBefore,
+                    "state applies " + stateBefore + " -> " + ctx.state.applies);
 
             // 3. clear = the user turned it off. Nothing may come back.
             AutoStartStore.clear(ctx, SLOT);
@@ -198,7 +222,8 @@ public class AutoStartHarness {
         //    after the update — with no app process around to fix it.
         {
             FakeContext ctx = new FakeContext();
-            ctx.prefs.map.put("vpn_schema", 1);
+            ctx.prefs.map.put("vpn_schema", 2);
+            ctx.armedAt(System.currentTimeMillis());
             ctx.prefs.map.put("vpn_config",
                     "{\"V2RAY_FULL_JSON_CONFIG\":\"{\\\"outbounds\\\":[]}\","
                             + "\"REMARK\":\"Old build\","
@@ -220,7 +245,8 @@ public class AutoStartHarness {
         //    6205a88 exists to prevent. Name first, then type-check, then fall back.
         {
             FakeContext ctx = new FakeContext();
-            ctx.prefs.map.put("vpn_schema", 1);
+            ctx.prefs.map.put("vpn_schema", 2);
+            ctx.armedAt(System.currentTimeMillis());
             ctx.prefs.map.put("vpn_config",
                     "{\"V2RAY_FULL_JSON_CONFIG\":\"{}\",\"APPLICATION_ICON\":"
                             + FakeResources.A_STRING + "}");
@@ -294,6 +320,67 @@ public class AutoStartHarness {
             AutoStartStore.save(ctx, SLOT, noJson);
             check("a config with no core JSON is never persisted",
                     AutoStartStore.load(ctx, SLOT) == null, "persisted anyway");
+        }
+
+        // 13. THE BLOB CARRIES AN EXPIRY, AND THE CLOCK IS THE ONLY THING THAT CAN AGE IT
+        //     across a reboot. Both directions matter: past the TTL it is dropped, and a
+        //     clock that has moved so far backwards that the age is meaningless is not
+        //     treated as "young".
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            check("fresh blob loads", AutoStartStore.load(ctx, SLOT) != null, "null");
+
+            ctx.state.map.put("vpn_saved_at", System.currentTimeMillis() - 8L * 24 * 3600 * 1000);
+            check("past the default TTL: no tunnel", AutoStartStore.load(ctx, SLOT) == null, "loaded");
+            check("past the default TTL: dropped", ctx.prefs.map.get("vpn_config") == null, "kept");
+
+            // A boot before the network fixes the clock reads a few hours early; that is
+            // normal and always-on must still work.
+            FakeContext ctx2 = new FakeContext();
+            AutoStartStore.save(ctx2, SLOT, sample());
+            ctx2.state.map.put("vpn_saved_at", System.currentTimeMillis() + 3600_000L);
+            check("a small backwards clock jump is tolerated",
+                    AutoStartStore.load(ctx2, SLOT) != null, "dropped a usable config");
+
+            ctx2.state.map.put("vpn_saved_at", System.currentTimeMillis() + 90L * 24 * 3600 * 1000);
+            check("a blob saved 90 days in the future cannot be aged, so it is dropped",
+                    AutoStartStore.load(ctx2, SLOT) == null, "loaded");
+
+            // No save time at all (a state file wiped independently of the blob) is not
+            // "age zero", it is "unknown".
+            FakeContext ctx3 = new FakeContext();
+            AutoStartStore.save(ctx3, SLOT, sample());
+            ctx3.state.map.remove("vpn_saved_at");
+            check("a blob with no save time is not restorable",
+                    AutoStartStore.load(ctx3, SLOT) == null, "loaded");
+        }
+
+        // 14. ttl_ms:0 IN THE CORE JSON MEANS "THE APP MUST BE PRESENT FOR THIS SESSION".
+        //     It is the Dart side's kill switch for a metered/capped connect, and it has
+        //     to work at SAVE time, because the stop that would otherwise clear the blob
+        //     is exactly the one that cannot be delivered from the background.
+        {
+            FakeContext ctx = new FakeContext();
+            AutoStartStore.save(ctx, SLOT, sample());
+            check("armed", AutoStartStore.load(ctx, SLOT) != null, "null");
+            V2rayConfig capped = sample();
+            capped.V2RAY_FULL_JSON_CONFIG =
+                    "{\"outbounds\":[],\"_doft_autostart\":{\"ttl_ms\":0}}";
+            AutoStartStore.save(ctx, SLOT, capped);
+            check("ttl_ms:0 is not persisted", AutoStartStore.load(ctx, SLOT) == null, "persisted");
+            check("ttl_ms:0 also drops what was there", ctx.prefs.map.get("vpn_config") == null, "kept");
+
+            // A shorter-than-default TTL is honoured too.
+            FakeContext ctx2 = new FakeContext();
+            V2rayConfig shortLived = sample();
+            shortLived.V2RAY_FULL_JSON_CONFIG =
+                    "{\"outbounds\":[],\"_doft_autostart\":{\"ttl_ms\":60000}}";
+            AutoStartStore.save(ctx2, SLOT, shortLived);
+            check("a one-minute TTL still loads inside the minute",
+                    AutoStartStore.load(ctx2, SLOT) != null, "null");
+            ctx2.state.map.put("vpn_saved_at", System.currentTimeMillis() - 61_000L);
+            check("and not outside it", AutoStartStore.load(ctx2, SLOT) == null, "loaded");
         }
 
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));

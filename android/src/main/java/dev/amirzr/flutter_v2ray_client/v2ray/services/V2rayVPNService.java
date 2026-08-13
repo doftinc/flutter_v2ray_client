@@ -27,10 +27,13 @@ import java.util.Arrays;
 
 public class V2rayVPNService extends VpnService implements V2rayServicesListener {
     private static final String TAG = "V2rayVPNService";
-    private ParcelFileDescriptor mInterface;
+    // volatile: the tun2socks watcher thread re-enters runTun2socks() and the sendFd
+    // thread reads the descriptor, while stopAllProcess() may be clearing both from
+    // whichever thread the core called back on.
+    private volatile ParcelFileDescriptor mInterface;
     private Process process;
     private V2rayConfig v2rayConfig;
-    private boolean isRunning = true;
+    private volatile boolean isRunning = true;
 
     @Override
     public void onCreate() {
@@ -161,6 +164,20 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         // not add a notification-permission check in front of it (6205a88): skipping
         // startForeground() misses the foreground-service deadline and the OS kills the
         // process outright.
+        //
+        // ⚠ NOT VERIFIED ON A DEVICE, AND KNOWN INCOMPLETE ON API 31+. Always-on gets an
+        // FGS-start exemption from the framework (addPowerSaveTempWhitelistApp with
+        // REASON_VPN); a plain START_STICKY restart does not obviously get one. If
+        // startForeground() is refused there it throws
+        // ForegroundServiceStartNotAllowedException INSIDE showNotification(), whose
+        // catch(Exception) swallows it - so startCore() still returns true and this
+        // method still reports a restored tunnel. The tunnel itself is real (setup() has
+        // to establish a tun before anything is cleared), but the service is running
+        // without a foreground notification and the OS may kill it shortly after. The
+        // only way to tell the two apart is a device test on API 31+: kill
+        // :RunSoLibV2RayDaemon while connected and watch for the notification. Fixing it
+        // properly means owning the startForeground() call here instead of inside
+        // V2rayCoreManager, which is another stream's file this round.
         if (!V2rayCoreManager.getInstance().startCore(restored)) {
             return stopCleanly("restored config did not start the core");
         }
@@ -202,30 +219,59 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         return START_NOT_STICKY;
     }
 
+    /**
+     * The real stop: no core, no tun2socks, no tun, no service. Every failure path in
+     * this class ends here, and none of them may end in {@code this.onDestroy()} — that
+     * runs the cleanup but leaves the SERVICE alive, which after a START_STICKY return is
+     * a process with no tunnel that the framework will keep restarting.
+     *
+     * <p>Safe to call twice and safe to call before {@link #setup()} ever ran, which it
+     * now is: the interface may legitimately be null here.
+     */
     private void stopAllProcess() {
-        stopForeground(true);
         isRunning = false;
-        if (process != null) {
-            process.destroy();
+        try {
+            stopForeground(true);
+        } catch (Exception e) {
+            Log.w(TAG, "stopForeground failed", e);
         }
-        V2rayCoreManager.getInstance().stopCore();
+        if (process != null) {
+            try {
+                process.destroy();
+            } catch (Exception e) {
+                Log.w(TAG, "could not destroy tun2socks", e);
+            }
+            process = null;
+        }
+        try {
+            V2rayCoreManager.getInstance().stopCore();
+        } catch (Exception e) {
+            Log.w(TAG, "stopCore failed", e);
+        }
         try {
             stopSelf();
         } catch (Exception e) {
-            // ignore
             Log.e("CANT_STOP", "SELF");
         }
         try {
-            mInterface.close();
+            if (mInterface != null) {
+                mInterface.close();
+            }
         } catch (Exception e) {
             // ignored
         }
-
+        mInterface = null;
     }
 
     private void setup() {
+        // ⚠ NOT A BARE RETURN. prepare() non-null means we are not the prepared VPN, so
+        // there will be no tun - and the core is ALREADY RUNNING when this listener
+        // callback fires. Returning here left a core with no tunnel, which is the shape
+        // where traffic leaves in clear.
         Intent prepare_intent = prepare(this);
         if (prepare_intent != null) {
+            Log.e(TAG, "not the prepared VPN, refusing to run a core with no tun");
+            stopAllProcess();
             return;
         }
         Builder builder = new Builder();
@@ -288,7 +334,10 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             }
         }
         try {
-            mInterface.close();
+            if (mInterface != null) {
+                mInterface.close();
+                mInterface = null;
+            }
         } catch (Exception e) {
             // ignore
         }
@@ -296,20 +345,33 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             builder.setMetered(false);
         }
 
+        // ⚠ establish() RETURNS NULL, IT DOES NOT THROW, when we are not (or are no
+        // longer) the prepared VPN - another VPN took the slot between prepare() above
+        // and here, or the framework revoked us on an app update. The old code assigned
+        // that null, declared the service running, cleared the restore budget, and then
+        // NPE'd inside sendFileDescriptor() - where the NPE was caught by runTun2socks'
+        // own handler. Net effect: core up, no tun, budget back at zero, so
+        // MAX_CONSECUTIVE_FAILURES could never bite and a sticky restart looped forever.
+        ParcelFileDescriptor tun = null;
         try {
-            mInterface = builder.establish();
-            isRunning = true;
-            // A tun interface exists, so whatever config produced it is known-good: this
-            // is the only place the restore budget may be cleared (see
-            // restoreLastKnownGood). Harmless on the user-initiated path, where save()
-            // has already cleared it.
-            AutoStartStore.noteRestoreSucceeded(this, AutoStartStore.SLOT_VPN);
-            runTun2socks();
+            tun = builder.establish();
         } catch (Exception e) {
             Log.e("VPN_SERVICE", "Failed to establish VPN interface", e);
-            stopAllProcess();
         }
-
+        if (tun == null) {
+            // Do NOT clear the restore budget: this attempt produced no tunnel, and the
+            // budget is the only thing that ends the restart loop.
+            Log.e("VPN_SERVICE", "builder.establish() produced no tun interface");
+            stopAllProcess();
+            return;
+        }
+        mInterface = tun;
+        isRunning = true;
+        // A tun interface exists, so whatever config produced it is known-good: this is
+        // the only place the restore budget may be cleared (see restoreLastKnownGood).
+        // Harmless on the user-initiated path, where save() has already cleared it.
+        AutoStartStore.noteRestoreSucceeded(this, AutoStartStore.SLOT_VPN);
+        runTun2socks();
     }
 
     private void runTun2socks() {
@@ -338,14 +400,26 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             }, "Tun2socks_Thread").start();
             sendFileDescriptor();
         } catch (Exception e) {
+            // ⚠ THIS WAS this.onDestroy(). Calling it by hand runs the cleanup but does
+            // NOT stop the service, so a failed tun2socks left a live service with no
+            // tunnel - and onStartCommand had already returned START_STICKY, so the
+            // framework kept it that way.
             Log.e("VPN_SERVICE", "FAILED=>", e);
-            this.onDestroy();
+            stopAllProcess();
         }
     }
 
     private void sendFileDescriptor() {
+        final ParcelFileDescriptor tun = mInterface;
+        if (tun == null) {
+            // The watcher thread re-enters runTun2socks() after tun2socks exits; by then
+            // stopAllProcess() may already have closed the interface. This used to be an
+            // NPE swallowed by runTun2socks' catch, which then called onDestroy() by hand.
+            Log.w(TAG, "no tun interface to hand to tun2socks");
+            return;
+        }
         String localSocksFile = new File(getApplicationContext().getFilesDir(), "sock_path").getAbsolutePath();
-        FileDescriptor tunFd = mInterface.getFileDescriptor();
+        FileDescriptor tunFd = tun.getFileDescriptor();
         new Thread(() -> {
             int tries = 0;
             while (true) {

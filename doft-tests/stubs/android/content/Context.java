@@ -11,5 +11,8 @@ public class Context {
   public ApplicationInfo getApplicationInfo(){ return new ApplicationInfo(); }
   public File getExternalFilesDir(String s){ return new File("/tmp/doft-assets"); }
   public File getDir(String s,int m){ return new File("/tmp/doft-assets"); }
+  public File getFilesDir(){ return new File("/tmp/doft-assets"); }
   public AssetManager getAssets(){ return new AssetManager(); }
+  public String getPackageName(){ return "com.doft.vpn"; }
+  public void sendBroadcast(Intent i){}
 }

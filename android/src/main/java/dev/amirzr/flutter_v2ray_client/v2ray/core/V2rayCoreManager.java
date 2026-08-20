@@ -502,9 +502,14 @@ public final class V2rayCoreManager {
     }
 
     public Long getV2rayServerDelay(final String config, final String url) {
+        // ⚠ THIS PATH NEVER SAW THE START PATH'S STRIPPING. It takes a config from Dart
+        // and hands it to the core directly, so `_doft_tuic` — the device's credential —
+        // used to travel into measureOutboundDelay untouched, which is precisely what
+        // applyTuic's own comment says must not happen.
+        final String cleaned = TuicConfigRewriter.stripPrivateKeys(config);
         try {
             try {
-                JSONObject config_json = new JSONObject(config);
+                JSONObject config_json = new JSONObject(cleaned);
                 JSONObject new_routing_json = config_json.getJSONObject("routing");
                 new_routing_json.remove("rules");
                 config_json.remove("routing");
@@ -512,7 +517,7 @@ public final class V2rayCoreManager {
                 return Libv2ray.measureOutboundDelay(config_json.toString(), url);
             } catch (Exception json_error) {
                 Log.e("getV2rayServerDelay", json_error.toString());
-                return Libv2ray.measureOutboundDelay(config, url);
+                return Libv2ray.measureOutboundDelay(cleaned, url);
             }
         } catch (Exception e) {
             Log.e("getV2rayServerDelayCore", e.toString());

@@ -77,6 +77,7 @@ echo
 javac -nowarn -cp "$JSON_JAR" -d build/tclasses \
   TuicRewriteHarness.java \
   stubs/android/util/Log.java \
+  "$SRC/core/Tun2socksArgs.java" \
   "$SRC/core/TuicConfigRewriter.java" || exit 1
 run_harness tuic java -cp "build/tclasses:$JSON_JAR" \
   dev.amirzr.flutter_v2ray_client.v2ray.core.TuicRewriteHarness

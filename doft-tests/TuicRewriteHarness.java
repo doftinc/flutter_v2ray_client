@@ -92,6 +92,33 @@ public class TuicRewriteHarness {
         o = r.getJSONArray("outbounds");
         check("unrelated outbounds untouched", o.length() == 3, "len=" + o.length());
 
+        // ── the keys that are ours and not xray's ────────────────────────────────────
+        // ⚠ THE DELAY PATH NEVER WENT THROUGH THE START PATH. getV2rayServerDelay hands a
+        // config straight to the core, so `_doft_tuic` — which carries the device's
+        // credential — was reaching measureOutboundDelay untouched, i.e. exactly what
+        // applyTuic's own comment says must never happen. Adding a second private key
+        // made that this change's problem rather than an inherited one.
+        String withBoth = new JSONObject()
+                .put("_doft_tuic", new JSONObject().put("uuid", "SECRET"))
+                .put("_doft_android", new JSONObject().put("udp_mode", "socks5"))
+                .put("outbounds", new JSONArray().put(plain("proxy", "vless")))
+                .toString();
+        String stripped = TuicConfigRewriter.stripPrivateKeys(withBoth);
+        check("strip: the credential block is gone",
+                !stripped.contains("_doft_tuic") && !stripped.contains("SECRET"), stripped);
+        check("strip: the android marker is gone",
+                !stripped.contains("_doft_android"), stripped);
+        check("strip: the outbounds survive",
+                new JSONObject(stripped).getJSONArray("outbounds").length() == 1, stripped);
+        String cleanCfg = new JSONObject()
+                .put("outbounds", new JSONArray().put(plain("proxy", "vless"))).toString();
+        check("strip: a config with neither key is returned untouched",
+                cleanCfg.equals(TuicConfigRewriter.stripPrivateKeys(cleanCfg)), cleanCfg);
+        check("strip: unparseable input is returned as-is, not dropped",
+                "not json".equals(TuicConfigRewriter.stripPrivateKeys("not json")), "not json");
+        check("strip: null in, null out",
+                TuicConfigRewriter.stripPrivateKeys(null) == null, "null");
+
         System.out.println(failures == 0 ? "\nALL PASS" : "\n" + failures + " FAILURE(S)");
         System.out.println("RESULT tuic checks=" + checks + " failures=" + failures);
         System.exit(failures == 0 ? 0 : 1);

@@ -18,6 +18,49 @@ final class TuicConfigRewriter {
     private TuicConfigRewriter() {}
 
     /**
+     * Every top-level key that is OURS and not xray's.
+     *
+     * <p>They are stripped on the start path — {@code applyTuic} for the first,
+     * {@code Utilities.parseV2rayJsonFile} for the second — but the start path is not the
+     * only path a whole config takes into the core.
+     */
+    static final String[] PRIVATE_KEYS = {"_doft_tuic", Tun2socksArgs.CONFIG_KEY};
+
+    /**
+     * Remove those keys from a config that is about to be handed to the core.
+     *
+     * <p>⚠ WHY THIS EXISTS AT ALL. {@code getV2rayServerDelay} takes a config from Dart,
+     * edits its routing and passes it straight to {@code Libv2ray.measureOutboundDelay}
+     * — it never goes through the start path, so nothing had ever stripped anything from
+     * it. That means {@code _doft_tuic}, which carries the device's credential, was
+     * being handed to the core by a code path whose own documentation says it must never
+     * reach it. Adding a second private key made that this change's problem rather than
+     * an inherited one.
+     *
+     * <p>Returns the input unchanged when there is nothing to remove or when it does not
+     * parse: a delay measurement is worth no risk to a config that is about to be dialled.
+     */
+    public static String stripPrivateKeys(String configJson) {
+        if (configJson == null) {
+            return null;
+        }
+        try {
+            org.json.JSONObject root = new org.json.JSONObject(configJson);
+            boolean touched = false;
+            for (String k : PRIVATE_KEYS) {
+                if (root.has(k)) {
+                    root.remove(k);
+                    touched = true;
+                }
+            }
+            return touched ? root.toString() : configJson;
+        } catch (Throwable e) {
+            Log.e(TAG, "stripPrivateKeys: config did not parse", e);
+            return configJson;
+        }
+    }
+
+    /**
      * The JSON half of {@link #applyTuic}: point every TUIC outbound at the port the
      * listener actually bound, and decide what to do when there is none.
      *

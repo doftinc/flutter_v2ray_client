@@ -1353,6 +1353,44 @@ public class ServiceHarness {
             privSet(null, V2rayVPNService.class, "PROOF_POLL_MS", 5000L);
         });
 
+        // ── 32. THE COMMAND LINE THE REAL SERVICE WILL EXEC ─────────────────────────
+        // ⚠ THE WIRING, NOT THE HELPER. Tun2socksHarness proves Tun2socksArgs.build()
+        // picks the right flag; this proves the SERVICE hands it the mode that arrived
+        // in the config, off the real private field, on a real instance that has been
+        // started the way Android starts it. Point `runTun2socks` back at a hardcoded
+        // vector — the shape that shipped and broke every datagram on Android — and
+        // these three go red while every other assertion in this file stays green,
+        // which is exactly how the defect survived until now.
+        run(() -> {
+            Disk d = new Disk();
+            TestVpn s = new TestVpn(d).withNativeLibs("/data/app/doft/lib/arm64");
+            V2rayConfig cfg = config(null);
+            cfg.LOCAL_SOCKS5_PORT = 10807;
+            cfg.TUN2SOCKS_UDP_MODE = "socks5";
+            userStart(s, cfg);
+            java.util.List<String> cmd = s.tun2socksCommand();
+            check("service: the tun2socks vector asks for a real SOCKS5 UDP ASSOCIATE",
+                    cmd.contains("--socks5-udp") && !cmd.contains("--enable-udprelay"),
+                    String.join(" ", cmd));
+            check("service: the socks port comes from the config, not a constant",
+                    cmd.contains("127.0.0.1:10807"), String.join(" ", cmd));
+            check("service: the binary is taken from nativeLibraryDir",
+                    cmd.get(0).equals("/data/app/doft/lib/arm64/libtun2socks.so"), cmd.get(0));
+        });
+
+        // 33. And the escape hatch reaches the process, or it is not an escape hatch.
+        run(() -> {
+            Disk d = new Disk();
+            TestVpn s = new TestVpn(d).withNativeLibs("/data/app/doft/lib/arm64");
+            V2rayConfig cfg = config(null);
+            cfg.TUN2SOCKS_UDP_MODE = "udpgw";
+            userStart(s, cfg);
+            java.util.List<String> cmd = s.tun2socksCommand();
+            check("service: `udpgw` in the config actually reaches the command line",
+                    cmd.contains("--enable-udprelay") && !cmd.contains("--socks5-udp"),
+                    String.join(" ", cmd));
+        });
+
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));
         System.out.println("RESULT services checks=" + checks + " failures=" + failures);
         // ⚠ ALWAYS exit(), never fall off the end of main(). Case 29 starts the REAL

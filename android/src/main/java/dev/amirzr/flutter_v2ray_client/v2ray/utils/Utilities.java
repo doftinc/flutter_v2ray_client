@@ -70,6 +70,31 @@ public class Utilities {
         v2rayConfig.NOTIFICATION_DISCONNECT_BUTTON_NAME = AppConfigs.NOTIFICATION_DISCONNECT_BUTTON_NAME;
         try {
             JSONObject config_json = new JSONObject(config);
+            // ⚠ READ AND REMOVED IN THE SAME BREATH, BEFORE ANYTHING ELSE CAN FAIL.
+            // `_doft_android` is OUR key, not xray's: it carries how tun2socks should
+            // relay UDP (see Tun2socksArgs). xray must never see it — an unknown
+            // top-level key is at best ignored and at worst a parse error, which would
+            // take the tunnel down for every Android user at once.
+            //
+            // ⚠ AND THE RE-SERIALISE IS THE WHOLE POINT OF DOING IT HERE. `config` is
+            // the string that becomes V2RAY_FULL_JSON_CONFIG and is handed to the core;
+            // the only other place this method writes it back is inside
+            // `if (AppConfigs.ENABLE_TRAFFIC_AND_SPEED_STATICS)`. Removing a key from
+            // `config_json` alone therefore does nothing at all whenever statics are
+            // off — which is exactly how the pre-existing `policy`/`stats` removals
+            // below have always behaved. Test: "the marker is gone with statics off".
+            org.json.JSONObject doftAndroid =
+                    config_json.optJSONObject(dev.amirzr.flutter_v2ray_client.v2ray.core
+                            .Tun2socksArgs.CONFIG_KEY);
+            v2rayConfig.TUN2SOCKS_UDP_MODE = dev.amirzr.flutter_v2ray_client.v2ray.core
+                    .Tun2socksArgs.normaliseUdpMode(
+                            doftAndroid == null ? null : doftAndroid.optString("udp_mode", ""));
+            if (config_json.has(dev.amirzr.flutter_v2ray_client.v2ray.core
+                    .Tun2socksArgs.CONFIG_KEY)) {
+                config_json.remove(dev.amirzr.flutter_v2ray_client.v2ray.core
+                        .Tun2socksArgs.CONFIG_KEY);
+                config = config_json.toString();
+            }
             try {
                 JSONArray inbounds = config_json.getJSONArray("inbounds");
                 for (int i = 0; i < inbounds.length(); i++) {

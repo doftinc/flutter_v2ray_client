@@ -9,6 +9,7 @@ import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import dev.amirzr.flutter_v2ray_client.v2ray.core.Tun2socksArgs;
 import dev.amirzr.flutter_v2ray_client.v2ray.core.V2rayCoreManager;
 import dev.amirzr.flutter_v2ray_client.v2ray.interfaces.V2rayServicesListener;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.AppConfigs;
@@ -501,16 +502,35 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         }
     }
 
+    /**
+     * The exact command line {@link #runTun2socks()} execs.
+     *
+     * <p>⚠ PUBLIC ONLY SO A TEST CAN READ IT, and that is the point rather than an
+     * apology. Building this vector needed a live VpnService, so the single word that
+     * decides whether this device can carry a datagram at all was unreachable by every
+     * test in this repo — and it was wrong for as long as anyone can measure. A seam
+     * that reads the REAL field on the REAL service is what makes "the config asked for
+     * udpgw and the process got udpgw" an assertion instead of a hope.
+     */
+    public ArrayList<String> tun2socksCommand() {
+        return Tun2socksArgs.build(
+                new File(getApplicationInfo().nativeLibraryDir, "libtun2socks.so").getAbsolutePath(),
+                v2rayConfig.LOCAL_SOCKS5_PORT,
+                1500,
+                v2rayConfig.TUN2SOCKS_UDP_MODE);
+    }
+
     private void runTun2socks() {
-        ArrayList<String> cmd = new ArrayList<>(
-                Arrays.asList(new File(getApplicationInfo().nativeLibraryDir, "libtun2socks.so").getAbsolutePath(),
-                        "--netif-ipaddr", "26.26.26.2",
-                        "--netif-netmask", "255.255.255.252",
-                        "--socks-server-addr", "127.0.0.1:" + v2rayConfig.LOCAL_SOCKS5_PORT,
-                        "--tunmtu", "1500",
-                        "--sock-path", "sock_path",
-                        "--enable-udprelay",
-                        "--loglevel", "error"));
+        // ⚠ THE UDP MODE IS THE WHOLE REASON THIS LINE MOVED OUT OF HERE. It used to
+        // read `--enable-udprelay`, which selects badvpn's udpgw framing and needs a
+        // udpgw server; `--socks-server-addr` is xray's SOCKS5 inbound, which does not
+        // speak udpgw, so every datagram this device produced went into a socket nobody
+        // could parse while TCP kept working. Measured, and the reasoning is in
+        // Tun2socksArgs — which is a separate class precisely so a test can read this
+        // command line without a VpnService.
+        ArrayList<String> cmd = tun2socksCommand();
+        Log.i(TAG, "tun2socks udp mode: "
+                + Tun2socksArgs.normaliseUdpMode(v2rayConfig.TUN2SOCKS_UDP_MODE));
         try {
             ProcessBuilder processBuilder = new ProcessBuilder(cmd);
             processBuilder.redirectErrorStream(true);

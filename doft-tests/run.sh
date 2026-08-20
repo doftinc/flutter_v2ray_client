@@ -31,7 +31,7 @@ mkdir -p build
 if [ ! -s "$JSON_JAR" ]; then
   curl -sSL -o "$JSON_JAR" https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
 fi
-rm -rf build/classes build/tclasses build/aclasses build/sclasses && mkdir -p build/classes
+rm -rf build/classes build/tclasses build/aclasses build/sclasses build/uclasses && mkdir -p build/classes
 
 TOTAL_CHECKS=0
 TOTAL_FAILURES=0
@@ -63,6 +63,7 @@ javac -nowarn -cp "$JSON_JAR" -d build/classes \
   Harness.java \
   $(find stubs -name '*.java') \
   "$SRC/interfaces/V2rayServicesListener.java" \
+  "$SRC/core/Tun2socksArgs.java" \
   "$SRC/utils/Utilities.java" "$SRC/utils/AppConfigs.java" "$SRC/utils/V2rayConfig.java" || exit 1
 run_harness endpoints java -cp "build/classes:$JSON_JAR" Harness
 
@@ -79,6 +80,24 @@ javac -nowarn -cp "$JSON_JAR" -d build/tclasses \
   "$SRC/core/TuicConfigRewriter.java" || exit 1
 run_harness tuic java -cp "build/tclasses:$JSON_JAR" \
   dev.amirzr.flutter_v2ray_client.v2ray.core.TuicRewriteHarness
+
+# ── the tun2socks command line ────────────────────────────────────────────────────
+# ⚠ THE ONE WORD THAT DECIDES WHETHER ANDROID CAN CARRY A DATAGRAM. The service passed
+# `--enable-udprelay`, which is badvpn's udpgw framing and needs a udpgw server; the
+# address it was pointed at is xray's SOCKS5 inbound, which does not speak udpgw. Every
+# datagram went into a socket nobody could parse while TCP measured 449-537 KB/s, so no
+# health check, no speed test and no user report could see it — only STUN, DNS-over-UDP,
+# QUIC and calls died. It survived because the vector was built inline in a method that
+# needs a live VpnService. Reverting Tun2socksArgs to emit `--enable-udprelay` by default
+# turns this red.
+echo
+javac -nowarn -cp "$JSON_JAR" -d build/uclasses \
+  Tun2socksHarness.java \
+  $(find stubs -name '*.java') \
+  "$SRC/interfaces/V2rayServicesListener.java" \
+  "$SRC/core/Tun2socksArgs.java" \
+  "$SRC/utils/Utilities.java" "$SRC/utils/AppConfigs.java" "$SRC/utils/V2rayConfig.java" || exit 1
+run_harness tun2socks java -cp "build/uclasses:$JSON_JAR" Tun2socksHarness
 
 # ── autostart store ───────────────────────────────────────────────────────────────
 # ⚠ THE ONE THAT DECIDES WHAT A START WE DID NOT MAKE DOES. Android hands a sticky
@@ -97,6 +116,7 @@ javac -nowarn -cp "$JSON_JAR" -d build/aclasses \
   AutoStartHarness.java LosablePrefs.java \
   $(find stubs -name '*.java') \
   "$SRC/interfaces/V2rayServicesListener.java" \
+  "$SRC/core/Tun2socksArgs.java" \
   "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" || exit 1
 run_harness autostart java -cp "build/aclasses:$JSON_JAR" AutoStartHarness
 
@@ -115,6 +135,7 @@ echo
 javac -nowarn -cp "$JSON_JAR" -d build/sclasses \
   ServiceHarness.java LosablePrefs.java \
   $(find stubs -name '*.java') \
+  "$SRC/core/Tun2socksArgs.java" \
   "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" "$SRC/utils/AppConfigs.java" \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/services/V2rayVPNService.java" "$SRC/services/V2rayProxyOnlyService.java" || exit 1

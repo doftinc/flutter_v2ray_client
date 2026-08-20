@@ -253,6 +253,12 @@ public final class AutoStartStore {
             o.put("CONNECTED_V2RAY_SERVER_ADDRESS", nullToEmpty(config.CONNECTED_V2RAY_SERVER_ADDRESS));
             o.put("CONNECTED_V2RAY_SERVER_PORT", nullToEmpty(config.CONNECTED_V2RAY_SERVER_PORT));
             o.put("LOCAL_SOCKS5_PORT", config.LOCAL_SOCKS5_PORT);
+            // ⚠ A RESTORE THAT LOSES THIS SILENTLY REINSTATES THE BUG IT FIXES. An
+            // always-on or sticky restart rebuilds the whole config from this blob, and
+            // an absent key would fall back to the class default — which happens to be
+            // the fix today, so the miss would be invisible until the day the default
+            // changes. Written and read explicitly for that reason.
+            o.put("TUN2SOCKS_UDP_MODE", nullToEmpty(config.TUN2SOCKS_UDP_MODE));
             o.put("LOCAL_HTTP_PORT", config.LOCAL_HTTP_PORT);
             // A null list and an empty list mean different things to the tun builder
             // (no bypass subnets => default route), so an absent key is kept absent.
@@ -401,6 +407,8 @@ public final class AutoStartStore {
             config.CONNECTED_V2RAY_SERVER_ADDRESS = o.optString("CONNECTED_V2RAY_SERVER_ADDRESS", "");
             config.CONNECTED_V2RAY_SERVER_PORT = o.optString("CONNECTED_V2RAY_SERVER_PORT", "");
             config.LOCAL_SOCKS5_PORT = o.optInt("LOCAL_SOCKS5_PORT", 10808);
+            config.TUN2SOCKS_UDP_MODE = dev.amirzr.flutter_v2ray_client.v2ray.core
+                    .Tun2socksArgs.normaliseUdpMode(o.optString("TUN2SOCKS_UDP_MODE", ""));
             config.LOCAL_HTTP_PORT = o.optInt("LOCAL_HTTP_PORT", 10809);
             config.BLOCKED_APPS = toStringList(o, "BLOCKED_APPS");
             config.BYPASS_SUBNETS = toStringList(o, "BYPASS_SUBNETS");

@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
 import dev.amirzr.flutter_v2ray_client.v2ray.core.Tun2socksArgs;
+import dev.amirzr.flutter_v2ray_client.v2ray.core.UnderlyingNetworkPolicy;
 import dev.amirzr.flutter_v2ray_client.v2ray.core.V2rayCoreManager;
 import dev.amirzr.flutter_v2ray_client.v2ray.interfaces.V2rayServicesListener;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.AppConfigs;
@@ -277,6 +278,11 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
      * now is: the interface may legitimately be null here.
      */
     private void stopAllProcess() {
+        // ⚠ FIRST, AND OUTSIDE EVERY TRY BELOW. A NetworkCallback outlives the service that
+        // registered it — the framework holds the reference — so a stop that skipped this
+        // would leak one callback per connect and keep calling setUnderlyingNetworks on a
+        // tunnel that no longer exists.
+        unwatchUnderlyingNetwork();
         isRunning = false;
         try {
             stopForeground(true);
@@ -415,6 +421,12 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         }
         mInterface = tun;
         isRunning = true;
+        // ⚠ THE DAEMON HAD NO IDEA THE NETWORK EVER CHANGED. This service runs in its own
+        // process; the only NetworkCallback in the whole tree lived in the Flutter Activity,
+        // which is the wrong process, is torn down when the app is backgrounded, and does not
+        // exist at all on an always-on or sticky start. So when the user walked out of the
+        // house nothing here noticed, and `setUnderlyingNetworks` was never called even once.
+        watchUnderlyingNetwork();
         // ⚠ THE BUDGET IS NOT CLEARED HERE, AND A TUN IS NOT A SUCCESS. This line used to
         // be AutoStartStore.noteRestoreSucceeded(...), on the reasoning that an interface
         // in hand means the tunnel works. It does not: a BLACK-HOLED ENTRY IP gives us a
@@ -518,6 +530,108 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
                 v2rayConfig.LOCAL_SOCKS5_PORT,
                 1500,
                 v2rayConfig.TUN2SOCKS_UDP_MODE);
+    }
+
+    /** Registered while the tunnel is up; see [stopAllProcess] for the unregister. */
+    private android.net.ConnectivityManager.NetworkCallback netCb;
+
+    /**
+     * Tell the framework which network is carrying the tunnel, and keep telling it.
+     *
+     * <p>⚠ IT DECLARES, IT DOES NOT DIAL. Reconnecting on the network-change edge was measured
+     * on 2026-08-12: Wi-Fi off at +61.8 s, re-dial at +63.3 s while LTE was not usable yet, and
+     * the transport chain then burned to EXHAUSTED by +137 s on a device whose cellular was
+     * fine. The engines re-bind their own sockets; what they cannot do is tell the SYSTEM which
+     * network is underneath, and that is all this does.
+     *
+     * <p>⚠ AND IT NEVER GUESSES. A network is declared only when the system says it has
+     * internet, is not itself a VPN and is VALIDATED (see {@link UnderlyingNetworkPolicy}); a
+     * loss clears the declaration back to null, which means "follow the system default" — the
+     * behaviour we already had. Declaring a dying Wi-Fi is strictly worse than declaring
+     * nothing.
+     *
+     * <p>Best-effort and never throws: on a device where the request cannot be registered the
+     * tunnel comes up exactly as it did before.
+     */
+    private void watchUnderlyingNetwork() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            return;
+        }
+        try {
+            final android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            unwatchUnderlyingNetwork();
+            android.net.NetworkRequest req = new android.net.NetworkRequest.Builder()
+                    .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build();
+            netCb = new android.net.ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onCapabilitiesChanged(android.net.Network n,
+                        android.net.NetworkCapabilities caps) {
+                    if (!isRunning || caps == null) {
+                        return;
+                    }
+                    boolean validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                            && caps.hasCapability(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                    boolean ok = UnderlyingNetworkPolicy.shouldDeclare(
+                            caps.hasCapability(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                            caps.hasCapability(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN),
+                            validated);
+                    if (!ok) {
+                        return;
+                    }
+                    try {
+                        setUnderlyingNetworks(new android.net.Network[] {n});
+                        Log.i(TAG, "underlying network declared: " + n);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "could not declare the underlying network", t);
+                    }
+                }
+
+                @Override
+                public void onLost(android.net.Network n) {
+                    if (!isRunning || !UnderlyingNetworkPolicy.clearOnLost()) {
+                        return;
+                    }
+                    try {
+                        // null = follow the system default. NEVER the next candidate: this
+                        // callback does not know what replaced it.
+                        setUnderlyingNetworks(null);
+                        Log.i(TAG, "underlying network cleared after a loss");
+                    } catch (Throwable t) {
+                        Log.w(TAG, "could not clear the underlying network", t);
+                    }
+                }
+            };
+            cm.registerNetworkCallback(req, netCb);
+        } catch (Throwable t) {
+            Log.w(TAG, "could not watch the underlying network", t);
+            netCb = null;
+        }
+    }
+
+    /** Idempotent; safe to call when nothing is registered. */
+    private void unwatchUnderlyingNetwork() {
+        if (netCb == null) {
+            return;
+        }
+        try {
+            final android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                cm.unregisterNetworkCallback(netCb);
+            }
+        } catch (Throwable t) {
+            // Already gone, or the framework refused. Either way there is nothing to undo.
+        }
+        netCb = null;
     }
 
     private void runTun2socks() {

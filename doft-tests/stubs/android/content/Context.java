@@ -15,4 +15,20 @@ public class Context {
   public AssetManager getAssets(){ return new AssetManager(); }
   public String getPackageName(){ return "com.doft.vpn"; }
   public void sendBroadcast(Intent i){}
+  /** The tunnel's own process asks for this to watch which network carries it. */
+  public static final String CONNECTIVITY_SERVICE = "connectivity";
+  /**
+   * ⚠ A SINGLETON, LIKE THE REAL ONE. Handing back a fresh instance per call made the
+   * register and the unregister land on DIFFERENT objects, so a test could watch the
+   * service register correctly and still see a counter of zero — a fixture that reports
+   * the production code broken when it is not.
+   */
+  private static android.net.ConnectivityManager cm;
+  public Object getSystemService(String name){
+    if (CONNECTIVITY_SERVICE.equals(name)) {
+      if (cm == null) cm = new android.net.ConnectivityManager();
+      return cm;
+    }
+    return null;
+  }
 }

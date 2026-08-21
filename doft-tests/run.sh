@@ -31,7 +31,7 @@ mkdir -p build
 if [ ! -s "$JSON_JAR" ]; then
   curl -sSL -o "$JSON_JAR" https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
 fi
-rm -rf build/classes build/tclasses build/aclasses build/sclasses build/uclasses && mkdir -p build/classes
+rm -rf build/classes build/tclasses build/aclasses build/sclasses build/uclasses build/nclasses && mkdir -p build/classes
 
 TOTAL_CHECKS=0
 TOTAL_FAILURES=0
@@ -100,6 +100,18 @@ javac -nowarn -cp "$JSON_JAR" -d build/uclasses \
   "$SRC/utils/Utilities.java" "$SRC/utils/AppConfigs.java" "$SRC/utils/V2rayConfig.java" || exit 1
 run_harness tun2socks java -cp "build/uclasses:$JSON_JAR" Tun2socksHarness
 
+# ── which network carries the tunnel ──────────────────────────────────────────────
+# ⚠ THE DAEMON HAD NO CONNECTIVITY AWARENESS AT ALL. The tunnel runs in its own process and
+# the only NetworkCallback in the tree lived in the Flutter Activity — wrong process, gone
+# when the app is backgrounded, absent entirely on an always-on start. So a Wi-Fi -> LTE
+# handover happened with nothing in the tunnel's process noticing and setUnderlyingNetworks
+# was never called. Loosening any leg of the rule below turns this red.
+echo
+javac -nowarn -cp "$JSON_JAR" -d build/nclasses \
+  UnderlyingNetworkHarness.java \
+  "$SRC/core/UnderlyingNetworkPolicy.java" || exit 1
+run_harness underlying-network java -cp "build/nclasses:$JSON_JAR" UnderlyingNetworkHarness
+
 # ── autostart store ───────────────────────────────────────────────────────────────
 # ⚠ THE ONE THAT DECIDES WHAT A START WE DID NOT MAKE DOES. Android hands a sticky
 # restart a NULL intent and hands an always-on start a bare action intent; neither can
@@ -136,7 +148,7 @@ echo
 javac -nowarn -cp "$JSON_JAR" -d build/sclasses \
   ServiceHarness.java LosablePrefs.java \
   $(find stubs -name '*.java') \
-  "$SRC/core/Tun2socksArgs.java" \
+  "$SRC/core/Tun2socksArgs.java" "$SRC/core/UnderlyingNetworkPolicy.java" \
   "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" "$SRC/utils/AppConfigs.java" \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/services/V2rayVPNService.java" "$SRC/services/V2rayProxyOnlyService.java" || exit 1

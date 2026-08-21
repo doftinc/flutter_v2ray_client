@@ -45,4 +45,10 @@ public class VpnService extends Service {
       return establishResult;
     }
   }
+
+  /** ⚠ RECORDED, NOT PERFORMED. What matters to a test is WHAT the service declares and
+   *  when it clears it — the real call is a binder hop with no observable return. */
+  public static Network[] declaredUnderlying = null;
+  public static int declareCalls = 0;
+  public void setUnderlyingNetworks(Network[] ns){ declaredUnderlying = ns; declareCalls++; }
 }

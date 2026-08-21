@@ -1391,6 +1391,90 @@ public class ServiceHarness {
                     String.join(" ", cmd));
         });
 
+        // ── 34. THE TUNNEL'S OWN PROCESS WATCHES THE NETWORK ────────────────────────
+        // ⚠ THE POINT IS THE PROCESS, NOT THE CALLBACK. Until 2026-08-21 the only
+        // NetworkCallback in the whole tree lived in the Flutter Activity: a different
+        // process, torn down the moment the app is backgrounded, and absent entirely on an
+        // always-on or sticky start where there is no Activity at all. So a Wi-Fi -> LTE
+        // handover happened with NOTHING in the tunnel's process noticing, and
+        // setUnderlyingNetworks was never called even once. These assertions are about the
+        // service doing it itself.
+        run(() -> {
+            if (android.net.ConnectivityManager.last != null) {
+                android.net.ConnectivityManager.last.reset();
+            }
+            android.net.VpnService.declaredUnderlying = null;
+            android.net.VpnService.declareCalls = 0;
+            Disk d = new Disk();
+            TestVpn s = new TestVpn(d);
+            // A real tun, or setup() bails at `establish() == null` long before it ever
+            // reaches the watcher — and the assertion below would be about the fixture.
+            VpnService.establishResult = new ParcelFileDescriptor();
+            userStart(s, config(null));
+            s.startService(); // what xray's startup() callback does: runs setup()
+
+            android.net.ConnectivityManager cm = android.net.ConnectivityManager.last;
+            // ⚠ ASSERT ON THE REGISTER, NOT ON A LIVE REGISTRATION. In a test JVM
+            // tun2socks cannot exec, so setup() registers and then stops the service in the
+            // same breath — which unregisters. That the service DID it from its own process
+            // is the property; `lastRegisteredCallback` is what the harness drives.
+            check("service: the tunnel's own process registers a network callback",
+                    cm != null && cm.registerCalls > 0 && cm.lastRegisteredCallback != null,
+                    cm == null ? "no ConnectivityManager asked for" : "registers=" + cm.registerCalls);
+            if (cm == null || cm.lastRegisteredCallback == null) return;
+
+            // ⚠ THE REQUEST MUST NAME BOTH CAPABILITIES. Without NOT_VPN the framework may
+            // offer our OWN tunnel as the network underneath it, which is a loop.
+            check("service: the request asks for INTERNET and NOT_VPN",
+                    cm.registeredRequest != null
+                            && cm.registeredRequest.required.contains(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            && cm.registeredRequest.required.contains(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN),
+                    String.valueOf(cm.registeredRequest == null ? null : cm.registeredRequest.required));
+
+            // ⚠ THE CALLBACK REFUSES TO ACT ON A TUNNEL THAT IS GONE, which is right in
+            // production and is exactly what a test JVM produces: tun2socks cannot exec, so
+            // setup() stopped the service. Put the flag back so the assertions below are
+            // about the DECLARATION rule and not about that.
+            privSet(s, V2rayVPNService.class, "isRunning", true);
+            android.net.Network wifi = new android.net.Network(1);
+            android.net.NetworkCapabilities good = new android.net.NetworkCapabilities()
+                    .add(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .add(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .add(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+            cm.lastRegisteredCallback.onCapabilitiesChanged(wifi, good);
+            check("service: a validated network is declared as the carrier",
+                    android.net.VpnService.declaredUnderlying != null
+                            && android.net.VpnService.declaredUnderlying.length == 1
+                            && android.net.VpnService.declaredUnderlying[0] == wifi,
+                    "declareCalls=" + android.net.VpnService.declareCalls);
+
+            // The captive-portal shape: joined, routable, reaching nothing. It must not
+            // displace a good declaration.
+            int before = android.net.VpnService.declareCalls;
+            android.net.NetworkCapabilities unvalidated = new android.net.NetworkCapabilities()
+                    .add(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .add(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN);
+            cm.lastRegisteredCallback.onCapabilitiesChanged(new android.net.Network(2), unvalidated);
+            check("service: an UNVALIDATED network never displaces the declaration",
+                    android.net.VpnService.declareCalls == before
+                            && android.net.VpnService.declaredUnderlying[0] == wifi, "");
+
+            // ⚠ A LOSS CLEARS TO null — "follow the system default" — and never promotes a
+            // guess. The callback reporting the loss does not know what replaced it.
+            cm.lastRegisteredCallback.onLost(wifi);
+            check("service: a lost network clears the declaration to null",
+                    android.net.VpnService.declaredUnderlying == null, "");
+
+            // ⚠ AND THE CALLBACK MUST NOT OUTLIVE THE TUNNEL. The framework holds the
+            // reference, so a stop that skipped the unregister would leak one per connect
+            // and keep declaring for a tunnel that no longer exists.
+            s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+            check("service: stopping unregisters the callback",
+                    cm.unregisterCalls > 0, "unregister=" + cm.unregisterCalls);
+        });
+
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));
         System.out.println("RESULT services checks=" + checks + " failures=" + failures);
         // ⚠ ALWAYS exit(), never fall off the end of main(). Case 29 starts the REAL

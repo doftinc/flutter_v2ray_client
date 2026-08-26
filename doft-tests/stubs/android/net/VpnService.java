@@ -24,12 +24,17 @@ public class VpnService extends Service {
    * alive with no tun while the core is about to be started.
    */
   public static boolean prepareThrows = false;
-  public static void reset(){ prepareResult = null; establishResult = null; establishThrows = false; establishCalls = 0; prepareThrows = false; }
+  public static void reset(){ protectResult = true; protectCalls = 0; lastProtectedFd = -1; prepareResult = null; establishResult = null; establishThrows = false; establishCalls = 0; prepareThrows = false; }
   public static Intent prepare(Context c){
     if (prepareThrows) { throw new IllegalStateException("system_server is gone"); }
     return prepareResult;
   }
-  public boolean protect(int socket){ return true; }
+  /** ⚠ SCRIPTABLE. It used to be a hard-coded `true`, so no test could express a
+   *  REFUSAL — and a refusal is the only interesting thing VpnService.protect does. */
+  public static boolean protectResult = true;
+  public static int protectCalls = 0;
+  public static int lastProtectedFd = -1;
+  public boolean protect(int socket){ protectCalls++; lastProtectedFd = socket; return protectResult; }
   public void onRevoke(){}
   public class Builder {
     public Builder setSession(String s){ return this; }

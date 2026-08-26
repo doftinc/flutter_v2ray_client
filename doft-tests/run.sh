@@ -82,6 +82,22 @@ javac -nowarn -cp "$JSON_JAR" -d build/tclasses \
 run_harness tuic java -cp "build/tclasses:$JSON_JAR" \
   dev.amirzr.flutter_v2ray_client.v2ray.core.TuicRewriteHarness
 
+# ── socket protection ──────────────────────────────────────────────────────────────
+# ⚠ THE ANSWER libv2ray ACTS ON. protectSocket() in doft_protect.go refuses a TUIC dial
+# when this says false, because quic-go opens the QUIC socket outside xray's dialer and
+# an unprotected one carries the tunnel's own packets back into the tunnel. The shim
+# answered `true` when there was no service to ask — an unprotected socket reported as
+# protected. There was not one assertion about any of this, and the VpnService stub's
+# hard-coded `protect() -> true` meant none could be written.
+echo
+javac -nowarn -cp "$JSON_JAR" -d build/pclasses \
+  ProtectorHarness.java \
+  $(find stubs -name '*.java') \
+  "$SRC/interfaces/V2rayServicesListener.java" \
+  "$SRC/core/SocketProtector.java" || exit 1
+run_harness protector java -cp "build/pclasses:$JSON_JAR" \
+  dev.amirzr.flutter_v2ray_client.v2ray.core.ProtectorHarness
+
 # ── the tun2socks command line ────────────────────────────────────────────────────
 # ⚠ THE ONE WORD THAT DECIDES WHETHER ANDROID CAN CARRY A DATAGRAM. The service passed
 # `--enable-udprelay`, which is badvpn's udpgw framing and needs a udpgw server; the

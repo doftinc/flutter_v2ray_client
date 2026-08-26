@@ -146,10 +146,10 @@ public final class V2rayCoreManager {
             Libv2ray.useProtector(new V2RayProtector() {
                 @Override
                 public boolean protect(long fd) {
-                    if (v2rayServicesListener != null) {
-                        return v2rayServicesListener.onProtect((int) fd);
-                    }
-                    return true;
+                    // ⚠ FAILS CLOSED — see SocketProtector. This used to answer `true`
+                    // when there was no service to ask, i.e. to report an unprotected
+                    // socket as protected, which is the answer libv2ray acts on.
+                    return SocketProtector.protect(v2rayServicesListener, fd);
                 }
             });
             // Initialize controller with callback handler

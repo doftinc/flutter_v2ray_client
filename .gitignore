@@ -81,3 +81,4 @@ example/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.j
 
 # Misc ignores
 coverage/
+doft-tests/build/

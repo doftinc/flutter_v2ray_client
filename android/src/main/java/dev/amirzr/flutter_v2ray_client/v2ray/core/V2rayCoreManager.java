@@ -146,10 +146,10 @@ public final class V2rayCoreManager {
             Libv2ray.useProtector(new V2RayProtector() {
                 @Override
                 public boolean protect(long fd) {
-                    if (v2rayServicesListener != null) {
-                        return v2rayServicesListener.onProtect((int) fd);
-                    }
-                    return true;
+                    // ⚠ FAILS CLOSED — see SocketProtector. This used to answer `true`
+                    // when there was no service to ask, i.e. to report an unprotected
+                    // socket as protected, which is the answer libv2ray acts on.
+                    return SocketProtector.protect(v2rayServicesListener, fd);
                 }
             });
             // Initialize controller with callback handler
@@ -233,7 +233,16 @@ public final class V2rayCoreManager {
                 Libv2ray.setProtectorServer(server, false);
             } catch (Exception ignored) {
             }
-            coreController.startLoop(v2rayConfig.V2RAY_FULL_JSON_CONFIG, 0);
+            // ⚠ TUIC STARTS BEFORE THE CORE, AND THE CORE NEVER SEES ITS BLOCK.
+            // xray-core has no TUIC at all, so the transport is a client compiled into
+            // our fork of libv2ray that speaks SOCKS5 on 127.0.0.1. The Dart side emits
+            // the outbound with a PLACEHOLDER port (only this side knows what the
+            // listener bound) plus a `_doft_tuic` block carrying the credentials. We
+            // start the listener, write the real port into every socks outbound tagged
+            // proxy-tuic*, and delete the block — it is not xray config, and it holds
+            // the device's credential.
+            String coreJson = applyTuic(v2rayConfig.V2RAY_FULL_JSON_CONFIG);
+            coreController.startLoop(coreJson, 0);
             V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_CONNECTED;
             if (isV2rayCoreRunning()) {
                 showNotification(v2rayConfig);
@@ -300,6 +309,12 @@ public final class V2rayCoreManager {
             if (isV2rayCoreRunning()) {
                 if (coreController != null) {
                     coreController.stopLoop();
+                }
+                // After the core, not before: the core may still be draining streams
+                // through the loopback listener while it shuts down.
+                try {
+                    Libv2ray.stopTuic();
+                } catch (Throwable ignored) {
                 }
                 v2rayServicesListener.stopService();
                 Log.e(V2rayCoreManager.class.getSimpleName(), "stopCore success => v2ray core stopped.");
@@ -378,13 +393,15 @@ public final class V2rayCoreManager {
             return;
         }
 
-        // Check notification permission for Android 13+
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ActivityCompat.checkSelfPermission(context,
-                    Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                return;
-            }
-        }
+        // IMPORTANT: do NOT early-return when POST_NOTIFICATIONS (Android 13+) is denied.
+        // This method is the ONLY caller of startForeground(), and the service was launched
+        // via startForegroundService() — so skipping startForeground() makes the OS kill the
+        // process with ForegroundServiceDidNotStartInTimeException ~5s later (a hard crash on
+        // API 31+). Every user who declined the notification permission would crash on Connect.
+        // startForeground() does NOT require POST_NOTIFICATIONS: the foreground service starts
+        // fine and the ongoing notification is simply suppressed by the OS when the permission
+        // is denied. So always build the notification + call startForeground() below; the
+        // permission only governs whether that notification is actually shown to the user.
 
         Intent launchIntent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
         if (launchIntent != null) {
@@ -422,7 +439,19 @@ public final class V2rayCoreManager {
                     notificationChannelID)
                     .setSmallIcon(v2rayConfig.APPLICATION_ICON)
                     .setContentTitle(v2rayConfig.REMARK)
-                    .addAction(0, v2rayConfig.NOTIFICATION_DISCONNECT_BUTTON_NAME, notificationContentPendingIntent)
+                    // ⚠ THIS IS `pendingIntent`, NOT `notificationContentPendingIntent`.
+                    // It used to be the latter, which made the "Disconnect" button open
+                    // the app with action FROM_DISCONNECT_BTN — a string nothing in this
+                    // plugin or in the app has ever read. So the button disconnected
+                    // nothing, and `stopIntent` (and with it every
+                    // AppConfigs.V2RAY_CONNECTION_MODE assignment in the two services,
+                    // whose only job is to choose which service class that intent names)
+                    // was computed and thrown away. `pendingIntent` carries
+                    // COMMAND=STOP_SERVICE to the service that is actually running, which
+                    // clears the autostart slot and broadcasts DISCONNECTED for the app to
+                    // pick up. Tapping the notification BODY still opens the app —
+                    // that is what setContentIntent below is for.
+                    .addAction(0, v2rayConfig.NOTIFICATION_DISCONNECT_BUTTON_NAME, pendingIntent)
                     .setPriority(NotificationCompat.PRIORITY_MIN)
                     .setShowWhen(false)
                     .setOnlyAlertOnce(true)
@@ -435,6 +464,24 @@ public final class V2rayCoreManager {
             Log.w("V2rayCoreManager", "Failed to show notification, continuing without notification", e);
             // VPN/Proxy continues to work even if notification fails
         }
+    }
+
+    /**
+     * Total DOWNLINK bytes counted since {@link #setUpListener} initialised the core,
+     * summed over every outbound tag in {@code statsTags}.
+     *
+     * <p>⚠ THIS IS THE ONLY EVIDENCE THE DAEMON PROCESS HAS THAT A TUNNEL ACTUALLY WORKS,
+     * and {@code V2rayVPNService} bounds its unattended restore chain on it. A tun
+     * interface, a running core and a completed handshake are all satisfied by a
+     * black-holed entry IP; bytes coming back are not. Downlink specifically: uplink
+     * rises whether or not anything is at the far end.
+     *
+     * <p>⚠ IT ONLY MOVES WHEN {@code ENABLE_TRAFFIC_STATICS} IS SET on the running config
+     * — {@link #makeDurationTimer} skips {@code queryStats} otherwise — which is why the
+     * restore path forces that flag on before {@link #startCore}.
+     */
+    public long getTotalDownloadBytes() {
+        return totalDownload;
     }
 
     public boolean isV2rayCoreRunning() {
@@ -455,9 +502,14 @@ public final class V2rayCoreManager {
     }
 
     public Long getV2rayServerDelay(final String config, final String url) {
+        // ⚠ THIS PATH NEVER SAW THE START PATH'S STRIPPING. It takes a config from Dart
+        // and hands it to the core directly, so `_doft_tuic` — the device's credential —
+        // used to travel into measureOutboundDelay untouched, which is precisely what
+        // applyTuic's own comment says must not happen.
+        final String cleaned = TuicConfigRewriter.stripPrivateKeys(config);
         try {
             try {
-                JSONObject config_json = new JSONObject(config);
+                JSONObject config_json = new JSONObject(cleaned);
                 JSONObject new_routing_json = config_json.getJSONObject("routing");
                 new_routing_json.remove("rules");
                 config_json.remove("routing");
@@ -465,12 +517,60 @@ public final class V2rayCoreManager {
                 return Libv2ray.measureOutboundDelay(config_json.toString(), url);
             } catch (Exception json_error) {
                 Log.e("getV2rayServerDelay", json_error.toString());
-                return Libv2ray.measureOutboundDelay(config, url);
+                return Libv2ray.measureOutboundDelay(cleaned, url);
             }
         } catch (Exception e) {
             Log.e("getV2rayServerDelayCore", e.toString());
             return -1L;
         }
+    }
+
+
+    /**
+     * Start the in-process TUIC listener when the config asks for one, point the socks
+     * outbounds at it, and strip the request block.
+     *
+     * ⚠ FAILING OPEN IS DELIBERATE. If the listener cannot start, the `proxy-tuic`
+     * members are REMOVED rather than left pointing at a dead port: a member that fails
+     * every probe costs the balancer a health check every interval over a thin mobile
+     * line, and on the engine where that budget is already scaled by member count. The
+     * tunnel comes up on the other transports exactly as it would have without TUIC.
+     *
+     * ⚠ AND IT MUST NEVER THROW. This runs between "user tapped connect" and
+     * startLoop(); an exception here would take down a tunnel that has nothing to do
+     * with TUIC, so anything unexpected returns the ORIGINAL config minus the block.
+     */
+    private String applyTuic(String configJson) {
+        if (configJson == null || !configJson.contains("_doft_tuic")) {
+            return configJson;
+        }
+        org.json.JSONObject root;
+        org.json.JSONObject req;
+        try {
+            root = new org.json.JSONObject(configJson);
+            req = root.optJSONObject("_doft_tuic");
+            // ⚠ STRIPPED BEFORE ANYTHING ELSE CAN FAIL. It is not xray config — an
+            // unknown top-level key is at best ignored and at worst a parse error — and
+            // it carries the device's credential. Every return path below is already
+            // clean because the removal happened here, not in a finally block.
+            root.remove("_doft_tuic");
+        } catch (Throwable e) {
+            // The config did not parse at all, so there is nothing safe to hand back but
+            // what we were given; the core will reject it and say why.
+            Log.e(V2rayCoreManager.class.getSimpleName(), "tuic: config did not parse", e);
+            return configJson;
+        }
+
+        long port = -1;
+        try {
+            if (req != null) {
+                port = Libv2ray.startTuic(req.toString());
+            }
+        } catch (Throwable e) {
+            Log.e(V2rayCoreManager.class.getSimpleName(), "tuic: listener failed to start", e);
+        }
+
+        return TuicConfigRewriter.rewrite(root, port);
     }
 
 }

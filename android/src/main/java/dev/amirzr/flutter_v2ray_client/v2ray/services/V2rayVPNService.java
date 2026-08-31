@@ -1,6 +1,9 @@
 package dev.amirzr.flutter_v2ray_client.v2ray.services;
 
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
@@ -9,9 +12,15 @@ import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import androidx.core.app.NotificationCompat;
+
+import dev.amirzr.flutter_v2ray_client.v2ray.core.Tun2socksArgs;
+import dev.amirzr.flutter_v2ray_client.v2ray.core.TunnelWatchdogPolicy;
+import dev.amirzr.flutter_v2ray_client.v2ray.core.UnderlyingNetworkPolicy;
 import dev.amirzr.flutter_v2ray_client.v2ray.core.V2rayCoreManager;
 import dev.amirzr.flutter_v2ray_client.v2ray.interfaces.V2rayServicesListener;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.AppConfigs;
+import dev.amirzr.flutter_v2ray_client.v2ray.utils.AutoStartStore;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.V2rayConfig;
 
 import org.json.JSONArray;
@@ -25,10 +34,115 @@ import java.util.ArrayList;
 import java.util.Arrays;
 
 public class V2rayVPNService extends VpnService implements V2rayServicesListener {
-    private ParcelFileDescriptor mInterface;
+    private static final String TAG = "V2rayVPNService";
+    // volatile: the tun2socks watcher thread re-enters runTun2socks() and the sendFd
+    // thread reads the descriptor, while stopAllProcess() may be clearing both from
+    // whichever thread the core called back on.
+    private volatile ParcelFileDescriptor mInterface;
     private Process process;
     private V2rayConfig v2rayConfig;
-    private boolean isRunning = true;
+    private volatile boolean isRunning = true;
+
+    /**
+     * How many downlink bytes this tunnel has to carry before the restore that built it
+     * counts as a success.
+     *
+     * <p>⚠ THIS NUMBER EXISTS BECAUSE {@code builder.establish() != null} IS NOT A
+     * SUCCESS SIGNAL. A black-holed entry IP establishes a tun, runs a core, completes a
+     * handshake and moves nothing — the shape measured on 85.189.101.44 on 2026-08-12,
+     * where every transport on both engines read 0 KB/s while the node looked healthy
+     * from outside, and the shape of the reality-on-.89 result (CDN connects, volume 0).
+     * Clearing the failure budget on establish() therefore let an always-on device
+     * restore a dead tunnel on every boot forever.
+     *
+     * <p><b>DOWNLINK, not uplink</b>: uplink rises whether or not there is anything at the
+     * other end. Downlink only rises when the far side answered.
+     *
+     * <p><b>512 KiB is a judgement, not a measurement.</b> It has to sit above whatever a
+     * black hole can return by accident — the handshakes it does complete are a few KB
+     * each, and a client that retries all night could accumulate a few tens of KB — and
+     * below anything a working tunnel on a phone reaches within minutes of a boot (one
+     * app-store metadata refresh is larger). If a device is ever seen losing its blob
+     * with a healthy tunnel, this is the number that is wrong, not the mechanism.
+     */
+    private static final long PROOF_DOWNLINK_BYTES = 512L * 1024L;
+
+    /**
+     * How often the proof watcher looks. Nothing is latency-sensitive here — the only
+     * deadline is "before the next restore" — so this is deliberately slow and cheap.
+     * ⚠ Not final: the test harness lowers it by reflection so the watcher can be driven
+     * end to end in a bounded run.
+     */
+    private static volatile long PROOF_POLL_MS = 5000L;
+
+    /**
+     * How often the carry watchdog asks whether the tunnel is carrying anything.
+     *
+     * <p>Deliberately slower than the Dart monitor's 20 s. This is the BACKSTOP: it only
+     * ever acts on a device whose app process is gone, where the alternative is the
+     * 37-minute outage measured on 2026-08-31, so a minute of extra latency costs
+     * nothing and a probe per 20 s from a daemon nobody is watching costs battery.
+     * ⚠ Not final: the harness lowers it by reflection to drive the watcher end to end.
+     */
+    private static volatile long WATCHDOG_POLL_MS = 60_000L;
+
+    /**
+     * How long a freshly established tunnel is left alone before the first probe.
+     *
+     * <p>A tun exists before the core has finished dialling its group; judging it in that
+     * window would restart a tunnel that was about to work. The Dart monitor has the same
+     * idea and calls it {@code gracePeriod}.
+     */
+    private static volatile long WATCHDOG_GRACE_MS = 60_000L;
+
+    /**
+     * The decision half of the watchdog — see {@link TunnelWatchdogPolicy} for what the
+     * rules are and why each one is that narrow. Rebuilt per tunnel, so a restart budget
+     * belongs to the tunnel in hand.
+     */
+    private volatile TunnelWatchdogPolicy watchdog;
+
+    /**
+     * Consecutive failed probes before the daemon acts.
+     *
+     * <p>Two, for the same reason the Dart monitor uses two: one failure is a lost packet
+     * on a mobile link, two in a row on a bounded probe is a pattern. One would restart a
+     * working tunnel every time a train went through a tunnel.
+     */
+    private static final int WATCHDOG_FAILURE_THRESHOLD = 2;
+
+    /**
+     * How many times to replay the config before giving up on fixing it silently.
+     *
+     * <p>Each replay re-runs the balancer's urltest across the whole group, so two of them
+     * is two independent chances to land on a member that is not black-holed. Unbounded,
+     * this is a restart loop on a device with no network at all — which is the common case
+     * for a tablet in a bag.
+     */
+    private static final int WATCHDOG_MAX_RESTARTS = 2;
+
+    /**
+     * The policy this build ships.
+     *
+     * <p>⚠ A FACTORY, SO A TEST CANNOT INVENT ITS OWN NUMBERS. The harness used to build
+     * {@code new TunnelWatchdogPolicy(2, 2)} itself, which meant changing either constant
+     * here — to 1, or to 0 restarts — left every assertion green. A test that constructs
+     * the subject cannot defend the value the subject ships with.
+     */
+    TunnelWatchdogPolicy newWatchdogPolicy() {
+        return new TunnelWatchdogPolicy(WATCHDOG_FAILURE_THRESHOLD, WATCHDOG_MAX_RESTARTS);
+    }
+
+    /** Notification id for the "not carrying" alert. Distinct from the foreground one. */
+    private static final int NOT_CARRYING_NOTIFICATION_ID = 8771;
+
+    /**
+     * Bumped by every {@link #setup()} that establishes an interface. A watcher whose
+     * generation is stale exits: without it, a tun torn down and rebuilt inside one
+     * process would leave the older watcher crediting the newer tunnel's bytes.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger tunGeneration =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     @Override
     public void onCreate() {
@@ -38,43 +152,58 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // Handle null intent case - can happen when service is restarted by system
-        if (intent == null) {
-            Log.w("V2rayVPNService", "onStartCommand called with null intent, stopping service");
-            this.onDestroy();
-            return START_NOT_STICKY;
+        AppConfigs.V2RAY_SERVICE_COMMANDS startCommand = null;
+        if (intent != null) {
+            try {
+                startCommand = (AppConfigs.V2RAY_SERVICE_COMMANDS) intent.getSerializableExtra("COMMAND");
+            } catch (Throwable t) {
+                // A foreign or unreadable extra is a start we do not understand, not a
+                // reason to take the process down.
+                Log.w(TAG, "COMMAND extra could not be read", t);
+            }
         }
 
-        AppConfigs.V2RAY_SERVICE_COMMANDS startCommand = (AppConfigs.V2RAY_SERVICE_COMMANDS) intent
-                .getSerializableExtra("COMMAND");
-
-        // Handle null command case
         if (startCommand == null) {
-            Log.w("V2rayVPNService", "No command found in intent, stopping service");
-            this.onDestroy();
-            return START_NOT_STICKY;
+            // TWO SYSTEM-INITIATED STARTS LAND HERE AND NEITHER CAN CARRY OUR EXTRAS.
+            //  * The START_STICKY restart after the process was killed: Android
+            //    redelivers a NULL intent. This branch used to answer it with
+            //    onDestroy() + START_NOT_STICKY, which is why the START_STICKY returned
+            //    at the bottom of this method has never once brought a tunnel back.
+            //  * Always-on VPN: the manifest declares SUPPORTS_ALWAYS_ON plus the
+            //    android.net.VpnService intent-filter, and our kill switch sends the user
+            //    to that OS setting. The framework then starts this service with a bare
+            //    action intent - no COMMAND, no V2RAY_CONFIG - so the user turned on the
+            //    setting we asked for and got an instantly destroyed service.
+            // Both mean "the tunnel should be up". Answer them from the last config that
+            // actually started, and only from that.
+            return restoreLastKnownGood(intent == null
+                    ? "sticky restart (null intent)"
+                    : "start with no COMMAND extra (always-on VPN)");
         }
 
         if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE)) {
             v2rayConfig = (V2rayConfig) intent.getSerializableExtra("V2RAY_CONFIG");
             if (v2rayConfig == null) {
-                Log.w("V2rayVPNService", "V2RAY_CONFIG is null, cannot start service");
-                this.onDestroy();
-                return START_NOT_STICKY;
+                return stopCleanly("V2RAY_CONFIG is null, cannot start service");
             }
             if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
                 V2rayCoreManager.getInstance().stopCore();
             }
             if (V2rayCoreManager.getInstance().startCore(v2rayConfig)) {
-                Log.i("V2rayVPNService", "onStartCommand success => v2ray core started.");
+                Log.i(TAG, "onStartCommand success => v2ray core started.");
+                // ONLY HERE, AFTER THE CORE IS ACTUALLY UP. This blob is what a
+                // system-initiated start replays; a config that never started must never
+                // be replayed.
+                AutoStartStore.save(this, AutoStartStore.SLOT_VPN, v2rayConfig);
             } else {
-                Log.e("V2rayVPNService", "Failed to start v2ray core");
-                this.onDestroy();
-                return START_NOT_STICKY;
+                return stopCleanly("failed to start v2ray core");
             }
         } else if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE)) {
             V2rayCoreManager.getInstance().stopCore();
             AppConfigs.V2RAY_CONFIG = null;
+            // The user turned the tunnel off. Nothing may bring it back: not a sticky
+            // restart, not always-on.
+            AutoStartStore.clear(this, AutoStartStore.SLOT_VPN);
         } else if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.MEASURE_DELAY)) {
             new Thread(() -> {
                 try {
@@ -88,37 +217,182 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
                 }
             }, "MEASURE_CONNECTED_V2RAY_SERVER_DELAY").start();
         } else {
-            Log.w("V2rayVPNService", "Unknown command received, stopping service");
-            this.onDestroy();
-            return START_NOT_STICKY;
+            return stopCleanly("unknown command received");
         }
         return START_STICKY;
     }
 
-    private void stopAllProcess() {
-        stopForeground(true);
-        isRunning = false;
-        if (process != null) {
-            process.destroy();
+    /**
+     * Bring the tunnel back from the last config that started the core, for a start the
+     * system made (sticky restart or always-on). Any doubt at all and the service stops:
+     * a VPN service that is up without a tunnel is worse than one that is down.
+     */
+    private int restoreLastKnownGood(final String reason) {
+        Log.i(TAG, "system-initiated start => " + reason);
+
+        // Idempotent. The framework re-sends the always-on start intent, and tearing a
+        // healthy tunnel down to rebuild it would be a self-inflicted outage.
+        if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
+            Log.i(TAG, "core is already running, nothing to restore");
+            return START_STICKY;
         }
-        V2rayCoreManager.getInstance().stopCore();
+
+        final V2rayConfig restored = AutoStartStore.load(this, AutoStartStore.SLOT_VPN);
+        if (restored == null) {
+            // Either the user stopped the tunnel (we cleared the store) or the blob could
+            // not be read back (load() dropped it). Nothing to start: fail closed.
+            return stopCleanly("no usable persisted config");
+        }
+
+        // ⚠ prepare() NON-NULL MEANS "ASK THE USER", AND THERE IS NOBODY TO ASK. There is
+        // no Activity on a system-initiated start, so the consent intent cannot be
+        // launched; and starting the core without an established tun interface would put
+        // the traffic on the wire outside the tunnel. Stop, cleanly, once.
+        try {
+            if (VpnService.prepare(this) != null) {
+                return stopCleanly("VPN consent not granted and no Activity to ask with");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "VpnService.prepare failed", t);
+            return stopCleanly("VpnService.prepare failed");
+        }
+
+        // A config that fails to start fails the same way every time, and always-on is
+        // retried by the framework whatever we return. Spend the budget, then give up.
+        if (!AutoStartStore.beginRestoreAttempt(this, AutoStartStore.SLOT_VPN)) {
+            return stopCleanly("restore budget spent, persisted config dropped");
+        }
+
+        v2rayConfig = restored;
+        // ⚠ THE PROOF DEPENDS ON THE COUNTERS RUNNING. V2rayCoreManager only polls
+        // queryStats when the config asks for traffic statistics, and the whole bound on
+        // this restore chain is "did downlink bytes move" (see PROOF_DOWNLINK_BYTES). A
+        // restored session with statistics off would never be able to prove itself, and
+        // would burn its failure budget while working perfectly. The cost is one
+        // queryStats per outbound tag per second, on a path with no app process watching.
+        restored.ENABLE_TRAFFIC_STATICS = true;
+        // This process starts fresh on a sticky restart, so the static is back at its
+        // default; showNotification() reads it to aim the notification's stop button.
+        AppConfigs.V2RAY_CONNECTION_MODE = AppConfigs.V2RAY_CONNECTION_MODES.VPN_TUN;
+
+        // ⚠ startCore() -> showNotification() -> startForeground() is the ONLY
+        // startForeground() call on this path, exactly as on the user-initiated one. Do
+        // not add a notification-permission check in front of it (6205a88): skipping
+        // startForeground() misses the foreground-service deadline and the OS kills the
+        // process outright.
+        //
+        // ⚠ NOT VERIFIED ON A DEVICE, AND KNOWN INCOMPLETE ON API 31+. Always-on gets an
+        // FGS-start exemption from the framework (addPowerSaveTempWhitelistApp with
+        // REASON_VPN); a plain START_STICKY restart does not obviously get one. If
+        // startForeground() is refused there it throws
+        // ForegroundServiceStartNotAllowedException INSIDE showNotification(), whose
+        // catch(Exception) swallows it - so startCore() still returns true and this
+        // method still reports a restored tunnel. The tunnel itself is real (setup() has
+        // to establish a tun before anything is cleared), but the service is running
+        // without a foreground notification and the OS may kill it shortly after. The
+        // only way to tell the two apart is a device test on API 31+: kill
+        // :RunSoLibV2RayDaemon while connected and watch for the notification. Fixing it
+        // properly means owning the startForeground() call here instead of inside
+        // V2rayCoreManager, which is another stream's file this round.
+        if (!V2rayCoreManager.getInstance().startCore(restored)) {
+            return stopCleanly("restored config did not start the core");
+        }
+        // ⚠ The failure budget is NOT cleared here. startCore() returning true means the
+        // core loop started, not that a tunnel exists - setup() still has to establish
+        // the tun, and it can fail. The budget is cleared in setup(), once there is a
+        // real interface; otherwise a config that starts a core and then dies would keep
+        // resetting its own budget and loop forever.
+        Log.i(TAG, "tunnel restored from persisted config => " + restored.REMARK);
+        // NOTHING IS SENT TO DART HERE, ON PURPOSE. The app process may not exist - that
+        // is the whole point of this path - and the only channel that exists is the
+        // per-second V2RAY_CONNECTION_INFO broadcast the core already sends, which is
+        // delivered to a RUNTIME-registered receiver (V2rayController.init). With no app
+        // process there is nobody registered and the broadcast is a no-op; once the app
+        // runs again it registers and picks the state up on the next tick, which is the
+        // same reconciliation it already does on resume. Waking the app from here would
+        // mean a manifest receiver that launches a process the user did not ask for.
+        return START_STICKY;
+    }
+
+    /**
+     * Stop for real. The old code called onDestroy() by hand, which runs the cleanup but
+     * does NOT stop the service: the service stayed alive with no core and, when it had
+     * been launched with startForegroundService(), no startForeground() either - which is
+     * the shape the OS kills with ForegroundServiceDidNotStartInTimeException.
+     */
+    private int stopCleanly(final String why) {
+        Log.w(TAG, "stopping service => " + why);
+        try {
+            stopForeground(true);
+        } catch (Exception e) {
+            Log.w(TAG, "stopForeground failed", e);
+        }
         try {
             stopSelf();
         } catch (Exception e) {
-            // ignore
+            Log.w(TAG, "stopSelf failed", e);
+        }
+        return START_NOT_STICKY;
+    }
+
+    /**
+     * The real stop: no core, no tun2socks, no tun, no service. Every failure path in
+     * this class ends here, and none of them may end in {@code this.onDestroy()} — that
+     * runs the cleanup but leaves the SERVICE alive, which after a START_STICKY return is
+     * a process with no tunnel that the framework will keep restarting.
+     *
+     * <p>Safe to call twice and safe to call before {@link #setup()} ever ran, which it
+     * now is: the interface may legitimately be null here.
+     */
+    private void stopAllProcess() {
+        // ⚠ FIRST, AND OUTSIDE EVERY TRY BELOW. A NetworkCallback outlives the service that
+        // registered it — the framework holds the reference — so a stop that skipped this
+        // would leak one callback per connect and keep calling setUnderlyingNetworks on a
+        // tunnel that no longer exists.
+        unwatchUnderlyingNetwork();
+        isRunning = false;
+        try {
+            stopForeground(true);
+        } catch (Exception e) {
+            Log.w(TAG, "stopForeground failed", e);
+        }
+        if (process != null) {
+            try {
+                process.destroy();
+            } catch (Exception e) {
+                Log.w(TAG, "could not destroy tun2socks", e);
+            }
+            process = null;
+        }
+        try {
+            V2rayCoreManager.getInstance().stopCore();
+        } catch (Exception e) {
+            Log.w(TAG, "stopCore failed", e);
+        }
+        try {
+            stopSelf();
+        } catch (Exception e) {
             Log.e("CANT_STOP", "SELF");
         }
         try {
-            mInterface.close();
+            if (mInterface != null) {
+                mInterface.close();
+            }
         } catch (Exception e) {
             // ignored
         }
-
+        mInterface = null;
     }
 
     private void setup() {
+        // ⚠ NOT A BARE RETURN. prepare() non-null means we are not the prepared VPN, so
+        // there will be no tun - and the core is ALREADY RUNNING when this listener
+        // callback fires. Returning here left a core with no tunnel, which is the shape
+        // where traffic leaves in clear.
         Intent prepare_intent = prepare(this);
         if (prepare_intent != null) {
+            Log.e(TAG, "not the prepared VPN, refusing to run a core with no tun");
+            stopAllProcess();
             return;
         }
         Builder builder = new Builder();
@@ -181,7 +455,10 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             }
         }
         try {
-            mInterface.close();
+            if (mInterface != null) {
+                mInterface.close();
+                mInterface = null;
+            }
         } catch (Exception e) {
             // ignore
         }
@@ -189,27 +466,475 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             builder.setMetered(false);
         }
 
+        // ⚠ establish() RETURNS NULL, IT DOES NOT THROW, when we are not (or are no
+        // longer) the prepared VPN - another VPN took the slot between prepare() above
+        // and here, or the framework revoked us on an app update. The old code assigned
+        // that null, declared the service running, cleared the restore budget, and then
+        // NPE'd inside sendFileDescriptor() - where the NPE was caught by runTun2socks'
+        // own handler. Net effect: core up, no tun, budget back at zero, so
+        // MAX_CONSECUTIVE_FAILURES could never bite and a sticky restart looped forever.
+        ParcelFileDescriptor tun = null;
         try {
-            mInterface = builder.establish();
-            isRunning = true;
-            runTun2socks();
+            tun = builder.establish();
         } catch (Exception e) {
             Log.e("VPN_SERVICE", "Failed to establish VPN interface", e);
-            stopAllProcess();
         }
+        if (tun == null) {
+            // Do NOT clear the restore budget: this attempt produced no tunnel, and the
+            // budget is the only thing that ends the restart loop.
+            Log.e("VPN_SERVICE", "builder.establish() produced no tun interface");
+            stopAllProcess();
+            return;
+        }
+        mInterface = tun;
+        isRunning = true;
+        // ⚠ THE DAEMON HAD NO IDEA THE NETWORK EVER CHANGED. This service runs in its own
+        // process; the only NetworkCallback in the whole tree lived in the Flutter Activity,
+        // which is the wrong process, is torn down when the app is backgrounded, and does not
+        // exist at all on an always-on or sticky start. So when the user walked out of the
+        // house nothing here noticed, and `setUnderlyingNetworks` was never called even once.
+        watchUnderlyingNetwork();
+        // ⚠ THE BUDGET IS NOT CLEARED HERE, AND A TUN IS NOT A SUCCESS. This line used to
+        // be AutoStartStore.noteRestoreSucceeded(...), on the reasoning that an interface
+        // in hand means the tunnel works. It does not: a BLACK-HOLED ENTRY IP gives us a
+        // tun, a running core and a completed handshake while moving zero bytes, so that
+        // clear let an always-on device restore a dead tunnel on every boot forever with
+        // the budget reset each time — and with the kill switch on, the user has no
+        // connectivity and no signal at all. The budget is now cleared only by the
+        // watcher below, once downlink bytes have actually moved.
+        startRestoreProofWatcher();
+        // ⚠ AND THE ONE THAT ACTS. The proof watcher above answers "was this restore
+        // good"; it stops looking the moment the answer is yes, and it never asks again.
+        // This one runs for the life of the tunnel, because a tunnel that carried at
+        // 09:00 tells you nothing about 12:26.
+        startCarryWatchdog();
+        runTun2socks();
+    }
 
+    /**
+     * Watch the tunnel this {@link #setup()} just built until it proves itself by carrying
+     * {@link #PROOF_DOWNLINK_BYTES} of DOWNLINK traffic, and only then clear the restore
+     * failure budget.
+     *
+     * <p>⚠ THIS IS THE BOUND ON THE RESTORE CHAIN, AND IT IS NOT A TIMER. Nothing here
+     * expires and nothing here counts reboots: a config that keeps working restores for
+     * as long as the user wants it to, which is the whole reason the round-2 expiry was
+     * removed (always-on is used by people who never open the app; a bound that switches
+     * it off after N boots or D days is a date on which their phone loses the network).
+     * What is bounded is a config that keeps FAILING — and "failing" now means "carried
+     * nothing", not "did not give us a tun", because the failure this exists to stop is
+     * the one where the tun is perfect and the far side is a black hole.
+     *
+     * <p>The thread is a DAEMON: it must never hold the daemon process up, and there is
+     * no teardown path that is guaranteed to run on a kill.
+     *
+     * <p><b>Known residual risk, stated plainly.</b> A device that restores, moves less
+     * than {@link #PROOF_DOWNLINK_BYTES} through the tunnel, and is killed again — three
+     * times consecutively — loses its blob and has to be re-armed by opening the app.
+     * That is a real hole for a phone that is offline or idle across three consecutive
+     * boots. It is accepted because from inside {@code :RunSoLibV2RayDaemon} an idle
+     * tunnel and a black-holed one are the same observation, and of the two failure modes
+     * the black hole is the unrecoverable one: a dropped blob is repaired by launching the
+     * app, whereas a restored black hole reports itself connected forever and never is.
+     */
+    private void startRestoreProofWatcher() {
+        final int generation = tunGeneration.incrementAndGet();
+        // The counter is not reset between two startCore() calls inside one process, so
+        // the proof is measured against where this tunnel started, not against zero.
+        final long baseline = downlinkBytes();
+        final Thread t = new Thread(() -> {
+            try {
+                while (watcherStillOwnsTunnel(generation)) {
+                    // (the proof watcher shares the guard: same two reasons, same clause)
+                    if (restoreProofTick(baseline)) {
+                        return;
+                    }
+                    Thread.sleep(PROOF_POLL_MS);
+                }
+            } catch (InterruptedException ignored) {
+                // teardown
+            } catch (Throwable other) {
+                Log.w(TAG, "restore proof watcher stopped", other);
+            }
+        }, "RestoreProof_Thread");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * One evaluation of the proof. Package-private and separate from the thread so the
+     * test harness can drive it deterministically.
+     *
+     * @return true once the tunnel has proved itself and the budget has been cleared
+     */
+    boolean restoreProofTick(final long baseline) {
+        final long moved = downlinkBytes() - baseline;
+        if (moved < PROOF_DOWNLINK_BYTES) {
+            return false;
+        }
+        Log.i(TAG, "tunnel carried " + moved + " downlink bytes => restore proved");
+        AutoStartStore.noteTunnelCarriedTraffic(this, AutoStartStore.SLOT_VPN);
+        return true;
+    }
+
+    /**
+     * Watch the tunnel for as long as it exists, and fix it when the app cannot.
+     *
+     * <p>⚠ THIS IS THE ONLY DEAD-TUNNEL DETECTOR THAT SURVIVES THE APP BEING KILLED, and
+     * until it existed there was none. {@code TunnelHealthMonitor} is a Dart
+     * {@code Timer.periodic} owned by {@code VpnController} in the Flutter process; the
+     * core runs here, in {@code :RunSoLibV2RayDaemon}, and outlives it. Measured on a MIUI
+     * tablet on 2026-08-31: app process gone, daemon up, 37 minutes of websocket timeouts
+     * to the web-proxy member and tuic timeouts to the entry, a VPN key icon and no
+     * internet — until a human opened the app, at which point the existing Dart logic
+     * fixed it in 21 seconds. The 21 seconds were never the problem.
+     *
+     * <p>Generation-tied and daemon, for the same two reasons as the proof watcher above:
+     * a tun rebuilt inside one process must not leave the old watcher judging the new
+     * tunnel, and nothing here may hold the process up on a kill.
+     */
+    private void startCarryWatchdog() {
+        final int generation = tunGeneration.get();
+        watchdog = newWatchdogPolicy();
+        final Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(WATCHDOG_GRACE_MS);
+                while (watcherStillOwnsTunnel(generation)) {
+                    carryWatchdogTick(probeCarries(), appProcessAlive());
+                    Thread.sleep(WATCHDOG_POLL_MS);
+                }
+            } catch (InterruptedException ignored) {
+                // teardown
+            } catch (Throwable other) {
+                Log.w(TAG, "carry watchdog stopped", other);
+            }
+        }, "CarryWatchdog_Thread");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * May the watcher armed at [generation] keep judging what it sees?
+     *
+     * <p>⚠ A METHOD, SO THE GUARD CAN BE DRIVEN. It is one clause in a while loop and its
+     * absence has no symptom a test can see: every replay would leave ANOTHER watcher
+     * running, all of them probing, all of them counting, and N of them racing to replay
+     * the same tunnel — a restart loop built out of the thing that exists to prevent one.
+     * Asserting it through the thread instead measures the fixture: in the harness no
+     * tunnel ever carries, so every watcher exits within milliseconds either way.
+     */
+    boolean watcherStillOwnsTunnel(final int generation) {
+        return isRunning && generation == tunGeneration.get();
+    }
+
+    /**
+     * One evaluation. Package-private and taking its two inputs rather than reading them,
+     * so the harness can drive every branch without a network or a second process — the
+     * same seam {@link #restoreProofTick(long)} uses and for the same reason.
+     *
+     * @return what was done, for the harness and the log
+     */
+    TunnelWatchdogPolicy.Action carryWatchdogTick(final boolean carried, final boolean appAlive) {
+        final TunnelWatchdogPolicy policy = watchdog;
+        if (policy == null) {
+            return TunnelWatchdogPolicy.Action.NONE;
+        }
+        final TunnelWatchdogPolicy.Action action = policy.onProbe(carried, appAlive);
+        switch (action) {
+            case RESTART:
+                Log.w(TAG, "tunnel is up and carrying nothing, and no app process is there "
+                        + "to fix it => replaying the config (restart "
+                        + policy.restartsUsed() + ")");
+                replayConfigInPlace();
+                break;
+            case ALERT:
+                Log.e(TAG, "tunnel still carrying nothing after "
+                        + policy.restartsUsed() + " restarts => telling the user");
+                alertNotCarrying();
+                break;
+            default:
+                break;
+        }
+        return action;
+    }
+
+    /**
+     * Is the Flutter app process alive, i.e. is the Dart failover running?
+     *
+     * <p>{@code getRunningAppProcesses} has returned only the CALLER'S OWN processes since
+     * API 22, which is exactly the question being asked here — no permission, no
+     * cross-app visibility, and the answer is authoritative for our own package.
+     *
+     * <p>⚠ UNKNOWN MEANS ALIVE. Every failure path returns true, so a daemon that cannot
+     * tell does NOTHING. Two failovers racing each other is a worse outcome than one that
+     * arrives a minute late, and the app's is the one with the chain, the country list and
+     * the endpoint memory behind it.
+     *
+     * <p>Package-private so the harness can drive the REAL method against a fake
+     * ActivityManager: this one boolean decides whether the daemon ever acts, and a
+     * decision nobody can drive is a decision nobody can defend.
+     */
+    boolean appProcessAlive() {
+        try {
+            final android.app.ActivityManager am =
+                    (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) {
+                return true;
+            }
+            final java.util.List<android.app.ActivityManager.RunningAppProcessInfo> running =
+                    am.getRunningAppProcesses();
+            if (running == null) {
+                return true;
+            }
+            final String main = getPackageName();
+            for (final android.app.ActivityManager.RunningAppProcessInfo p : running) {
+                if (main.equals(p.processName)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            Log.w(TAG, "could not tell whether the app process is alive", t);
+            return true;
+        }
+    }
+
+    /** Does the tunnel carry anything, asked THROUGH the running core. */
+    private boolean probeCarries() {
+        try {
+            final Long delay = V2rayCoreManager.getInstance().getConnectedV2rayServerDelay();
+            return delay != null && delay > 0L;
+        } catch (Throwable t) {
+            Log.w(TAG, "carry probe threw", t);
+            return false;
+        }
+    }
+
+    /**
+     * Replay the config we are already running, through the path the app itself uses.
+     *
+     * <p>⚠ NOT {@code stopCore()} FOLLOWED BY {@code startCore()} FROM HERE.
+     * {@code stopCore()} calls {@code v2rayServicesListener.stopService()} — it takes the
+     * SERVICE down, not just the core — and on the app's path that is safe only because a
+     * fresh START intent is already in hand. Doing it from a watchdog thread would leave
+     * the user with no tunnel at all, which is the one outcome this class must never
+     * produce. Sending ourselves the same START_SERVICE the app sends reuses that whole
+     * vetted path: stop, start, persist, notification, new tun, new generation — and this
+     * watcher exits on the generation bump, with a fresh one started by {@link #setup()}.
+     *
+     * <p>What it buys: the config carries the entire balancer group, so a fresh
+     * {@code startCore} re-runs the urltest across every member and can land on one that
+     * is not black-holed. That is the cheapest thing that has ever fixed this shape.
+     */
+    private void replayConfigInPlace() {
+        final V2rayConfig cfg = v2rayConfig != null
+                ? v2rayConfig
+                : AutoStartStore.load(this, AutoStartStore.SLOT_VPN);
+        if (cfg == null) {
+            Log.w(TAG, "nothing to replay: no config in hand and none persisted");
+            return;
+        }
+        try {
+            final Intent again = new Intent(this, V2rayVPNService.class);
+            again.putExtra("COMMAND", AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE);
+            again.putExtra("V2RAY_CONFIG", cfg);
+            startService(again);
+        } catch (Throwable t) {
+            Log.w(TAG, "could not replay the config", t);
+        }
+    }
+
+    /**
+     * Tell the user the tunnel is not carrying, and leave the tunnel up.
+     *
+     * <p>⚠ THE TUNNEL STAYS. Failing closed leaves them with no internet; failing OPEN
+     * puts their traffic on the wire while they believe it is inside a tunnel. For this
+     * product the second is the worse harm, so the last resort is a sentence, not an
+     * exposure. The notification is the honest escape hatch: it turns "my internet died
+     * and I found out 37 minutes later" into "my phone told me and I tapped it".
+     *
+     * <p>Best-effort by construction. Without POST_NOTIFICATIONS on API 33+ this is a
+     * silent no-op, which is the same bargain the foreground notification already makes.
+     */
+    private void alertNotCarrying() {
+        try {
+            final NotificationManager nm =
+                    (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) {
+                return;
+            }
+            final String channelId = "A_FLUTTER_V2RAY_SERVICE_CH_ID";
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // Same id the foreground notification uses, so this rides a channel the
+                // user has already seen and can silence on its own terms.
+                nm.createNotificationChannel(new NotificationChannel(
+                        channelId, "VPN", NotificationManager.IMPORTANCE_DEFAULT));
+            }
+            final Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
+            android.app.PendingIntent tap = null;
+            if (open != null) {
+                open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                tap = android.app.PendingIntent.getActivity(
+                        this, 0, open,
+                        android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                                | android.app.PendingIntent.FLAG_IMMUTABLE);
+            }
+            final NotificationCompat.Builder b = new NotificationCompat.Builder(this, channelId)
+                    .setSmallIcon(android.R.drawable.stat_notify_error)
+                    .setContentTitle("VPN is connected but not carrying traffic")
+                    .setContentText("Tap to reconnect.")
+                    .setAutoCancel(true)
+                    .setOnlyAlertOnce(true);
+            if (tap != null) {
+                b.setContentIntent(tap);
+            }
+            nm.notify(NOT_CARRYING_NOTIFICATION_ID, b.build());
+        } catch (Throwable t) {
+            Log.w(TAG, "could not post the not-carrying alert", t);
+        }
+    }
+
+    /** Total downlink bytes the core has counted since it was initialised; 0 on error. */
+    private long downlinkBytes() {
+        try {
+            return V2rayCoreManager.getInstance().getTotalDownloadBytes();
+        } catch (Throwable t) {
+            Log.w(TAG, "could not read the downlink counter", t);
+            return 0L;
+        }
+    }
+
+    /**
+     * The exact command line {@link #runTun2socks()} execs.
+     *
+     * <p>⚠ PUBLIC ONLY SO A TEST CAN READ IT, and that is the point rather than an
+     * apology. Building this vector needed a live VpnService, so the single word that
+     * decides whether this device can carry a datagram at all was unreachable by every
+     * test in this repo — and it was wrong for as long as anyone can measure. A seam
+     * that reads the REAL field on the REAL service is what makes "the config asked for
+     * udpgw and the process got udpgw" an assertion instead of a hope.
+     */
+    public ArrayList<String> tun2socksCommand() {
+        return Tun2socksArgs.build(
+                new File(getApplicationInfo().nativeLibraryDir, "libtun2socks.so").getAbsolutePath(),
+                v2rayConfig.LOCAL_SOCKS5_PORT,
+                1500,
+                v2rayConfig.TUN2SOCKS_UDP_MODE);
+    }
+
+    /** Registered while the tunnel is up; see [stopAllProcess] for the unregister. */
+    private android.net.ConnectivityManager.NetworkCallback netCb;
+
+    /**
+     * Tell the framework which network is carrying the tunnel, and keep telling it.
+     *
+     * <p>⚠ IT DECLARES, IT DOES NOT DIAL. Reconnecting on the network-change edge was measured
+     * on 2026-08-12: Wi-Fi off at +61.8 s, re-dial at +63.3 s while LTE was not usable yet, and
+     * the transport chain then burned to EXHAUSTED by +137 s on a device whose cellular was
+     * fine. The engines re-bind their own sockets; what they cannot do is tell the SYSTEM which
+     * network is underneath, and that is all this does.
+     *
+     * <p>⚠ AND IT NEVER GUESSES. A network is declared only when the system says it has
+     * internet, is not itself a VPN and is VALIDATED (see {@link UnderlyingNetworkPolicy}); a
+     * loss clears the declaration back to null, which means "follow the system default" — the
+     * behaviour we already had. Declaring a dying Wi-Fi is strictly worse than declaring
+     * nothing.
+     *
+     * <p>Best-effort and never throws: on a device where the request cannot be registered the
+     * tunnel comes up exactly as it did before.
+     */
+    private void watchUnderlyingNetwork() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            return;
+        }
+        try {
+            final android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return;
+            }
+            unwatchUnderlyingNetwork();
+            android.net.NetworkRequest req = new android.net.NetworkRequest.Builder()
+                    .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build();
+            netCb = new android.net.ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onCapabilitiesChanged(android.net.Network n,
+                        android.net.NetworkCapabilities caps) {
+                    if (!isRunning || caps == null) {
+                        return;
+                    }
+                    boolean validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+                            && caps.hasCapability(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+                    boolean ok = UnderlyingNetworkPolicy.shouldDeclare(
+                            caps.hasCapability(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                            caps.hasCapability(
+                                    android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN),
+                            validated);
+                    if (!ok) {
+                        return;
+                    }
+                    try {
+                        setUnderlyingNetworks(new android.net.Network[] {n});
+                        Log.i(TAG, "underlying network declared: " + n);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "could not declare the underlying network", t);
+                    }
+                }
+
+                @Override
+                public void onLost(android.net.Network n) {
+                    if (!isRunning || !UnderlyingNetworkPolicy.clearOnLost()) {
+                        return;
+                    }
+                    try {
+                        // null = follow the system default. NEVER the next candidate: this
+                        // callback does not know what replaced it.
+                        setUnderlyingNetworks(null);
+                        Log.i(TAG, "underlying network cleared after a loss");
+                    } catch (Throwable t) {
+                        Log.w(TAG, "could not clear the underlying network", t);
+                    }
+                }
+            };
+            cm.registerNetworkCallback(req, netCb);
+        } catch (Throwable t) {
+            Log.w(TAG, "could not watch the underlying network", t);
+            netCb = null;
+        }
+    }
+
+    /** Idempotent; safe to call when nothing is registered. */
+    private void unwatchUnderlyingNetwork() {
+        if (netCb == null) {
+            return;
+        }
+        try {
+            final android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                cm.unregisterNetworkCallback(netCb);
+            }
+        } catch (Throwable t) {
+            // Already gone, or the framework refused. Either way there is nothing to undo.
+        }
+        netCb = null;
     }
 
     private void runTun2socks() {
-        ArrayList<String> cmd = new ArrayList<>(
-                Arrays.asList(new File(getApplicationInfo().nativeLibraryDir, "libtun2socks.so").getAbsolutePath(),
-                        "--netif-ipaddr", "26.26.26.2",
-                        "--netif-netmask", "255.255.255.252",
-                        "--socks-server-addr", "127.0.0.1:" + v2rayConfig.LOCAL_SOCKS5_PORT,
-                        "--tunmtu", "1500",
-                        "--sock-path", "sock_path",
-                        "--enable-udprelay",
-                        "--loglevel", "error"));
+        // ⚠ THE UDP MODE IS THE WHOLE REASON THIS LINE MOVED OUT OF HERE. It used to
+        // read `--enable-udprelay`, which selects badvpn's udpgw framing and needs a
+        // udpgw server; `--socks-server-addr` is xray's SOCKS5 inbound, which does not
+        // speak udpgw, so every datagram this device produced went into a socket nobody
+        // could parse while TCP kept working. Measured, and the reasoning is in
+        // Tun2socksArgs — which is a separate class precisely so a test can read this
+        // command line without a VpnService.
+        ArrayList<String> cmd = tun2socksCommand();
+        Log.i(TAG, "tun2socks udp mode: "
+                + Tun2socksArgs.normaliseUdpMode(v2rayConfig.TUN2SOCKS_UDP_MODE));
         try {
             ProcessBuilder processBuilder = new ProcessBuilder(cmd);
             processBuilder.redirectErrorStream(true);
@@ -226,14 +951,26 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             }, "Tun2socks_Thread").start();
             sendFileDescriptor();
         } catch (Exception e) {
+            // ⚠ THIS WAS this.onDestroy(). Calling it by hand runs the cleanup but does
+            // NOT stop the service, so a failed tun2socks left a live service with no
+            // tunnel - and onStartCommand had already returned START_STICKY, so the
+            // framework kept it that way.
             Log.e("VPN_SERVICE", "FAILED=>", e);
-            this.onDestroy();
+            stopAllProcess();
         }
     }
 
     private void sendFileDescriptor() {
+        final ParcelFileDescriptor tun = mInterface;
+        if (tun == null) {
+            // The watcher thread re-enters runTun2socks() after tun2socks exits; by then
+            // stopAllProcess() may already have closed the interface. This used to be an
+            // NPE swallowed by runTun2socks' catch, which then called onDestroy() by hand.
+            Log.w(TAG, "no tun interface to hand to tun2socks");
+            return;
+        }
         String localSocksFile = new File(getApplicationContext().getFilesDir(), "sock_path").getAbsolutePath();
-        FileDescriptor tunFd = mInterface.getFileDescriptor();
+        FileDescriptor tunFd = tun.getFileDescriptor();
         new Thread(() -> {
             int tries = 0;
             while (true) {
@@ -310,6 +1047,9 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
 
     @Override
     public void onRevoke() {
+        // The user revoked our VPN consent, or another app took the VPN slot. That is the
+        // user turning the tunnel off, so it must not come back on a system start.
+        AutoStartStore.clear(this, AutoStartStore.SLOT_VPN);
         stopAllProcess();
     }
 

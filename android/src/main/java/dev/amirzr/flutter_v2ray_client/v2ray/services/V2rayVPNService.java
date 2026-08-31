@@ -1,6 +1,9 @@
 package dev.amirzr.flutter_v2ray_client.v2ray.services;
 
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
@@ -9,7 +12,10 @@ import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import androidx.core.app.NotificationCompat;
+
 import dev.amirzr.flutter_v2ray_client.v2ray.core.Tun2socksArgs;
+import dev.amirzr.flutter_v2ray_client.v2ray.core.TunnelWatchdogPolicy;
 import dev.amirzr.flutter_v2ray_client.v2ray.core.UnderlyingNetworkPolicy;
 import dev.amirzr.flutter_v2ray_client.v2ray.core.V2rayCoreManager;
 import dev.amirzr.flutter_v2ray_client.v2ray.interfaces.V2rayServicesListener;
@@ -68,6 +74,67 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
      * end to end in a bounded run.
      */
     private static volatile long PROOF_POLL_MS = 5000L;
+
+    /**
+     * How often the carry watchdog asks whether the tunnel is carrying anything.
+     *
+     * <p>Deliberately slower than the Dart monitor's 20 s. This is the BACKSTOP: it only
+     * ever acts on a device whose app process is gone, where the alternative is the
+     * 37-minute outage measured on 2026-08-31, so a minute of extra latency costs
+     * nothing and a probe per 20 s from a daemon nobody is watching costs battery.
+     * ⚠ Not final: the harness lowers it by reflection to drive the watcher end to end.
+     */
+    private static volatile long WATCHDOG_POLL_MS = 60_000L;
+
+    /**
+     * How long a freshly established tunnel is left alone before the first probe.
+     *
+     * <p>A tun exists before the core has finished dialling its group; judging it in that
+     * window would restart a tunnel that was about to work. The Dart monitor has the same
+     * idea and calls it {@code gracePeriod}.
+     */
+    private static volatile long WATCHDOG_GRACE_MS = 60_000L;
+
+    /**
+     * The decision half of the watchdog — see {@link TunnelWatchdogPolicy} for what the
+     * rules are and why each one is that narrow. Rebuilt per tunnel, so a restart budget
+     * belongs to the tunnel in hand.
+     */
+    private volatile TunnelWatchdogPolicy watchdog;
+
+    /**
+     * Consecutive failed probes before the daemon acts.
+     *
+     * <p>Two, for the same reason the Dart monitor uses two: one failure is a lost packet
+     * on a mobile link, two in a row on a bounded probe is a pattern. One would restart a
+     * working tunnel every time a train went through a tunnel.
+     */
+    private static final int WATCHDOG_FAILURE_THRESHOLD = 2;
+
+    /**
+     * How many times to replay the config before giving up on fixing it silently.
+     *
+     * <p>Each replay re-runs the balancer's urltest across the whole group, so two of them
+     * is two independent chances to land on a member that is not black-holed. Unbounded,
+     * this is a restart loop on a device with no network at all — which is the common case
+     * for a tablet in a bag.
+     */
+    private static final int WATCHDOG_MAX_RESTARTS = 2;
+
+    /**
+     * The policy this build ships.
+     *
+     * <p>⚠ A FACTORY, SO A TEST CANNOT INVENT ITS OWN NUMBERS. The harness used to build
+     * {@code new TunnelWatchdogPolicy(2, 2)} itself, which meant changing either constant
+     * here — to 1, or to 0 restarts — left every assertion green. A test that constructs
+     * the subject cannot defend the value the subject ships with.
+     */
+    TunnelWatchdogPolicy newWatchdogPolicy() {
+        return new TunnelWatchdogPolicy(WATCHDOG_FAILURE_THRESHOLD, WATCHDOG_MAX_RESTARTS);
+    }
+
+    /** Notification id for the "not carrying" alert. Distinct from the foreground one. */
+    private static final int NOT_CARRYING_NOTIFICATION_ID = 8771;
 
     /**
      * Bumped by every {@link #setup()} that establishes an interface. A watcher whose
@@ -436,6 +503,11 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         // connectivity and no signal at all. The budget is now cleared only by the
         // watcher below, once downlink bytes have actually moved.
         startRestoreProofWatcher();
+        // ⚠ AND THE ONE THAT ACTS. The proof watcher above answers "was this restore
+        // good"; it stops looking the moment the answer is yes, and it never asks again.
+        // This one runs for the life of the tunnel, because a tunnel that carried at
+        // 09:00 tells you nothing about 12:26.
+        startCarryWatchdog();
         runTun2socks();
     }
 
@@ -472,7 +544,8 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         final long baseline = downlinkBytes();
         final Thread t = new Thread(() -> {
             try {
-                while (isRunning && generation == tunGeneration.get()) {
+                while (watcherStillOwnsTunnel(generation)) {
+                    // (the proof watcher shares the guard: same two reasons, same clause)
                     if (restoreProofTick(baseline)) {
                         return;
                     }
@@ -502,6 +575,223 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         Log.i(TAG, "tunnel carried " + moved + " downlink bytes => restore proved");
         AutoStartStore.noteTunnelCarriedTraffic(this, AutoStartStore.SLOT_VPN);
         return true;
+    }
+
+    /**
+     * Watch the tunnel for as long as it exists, and fix it when the app cannot.
+     *
+     * <p>⚠ THIS IS THE ONLY DEAD-TUNNEL DETECTOR THAT SURVIVES THE APP BEING KILLED, and
+     * until it existed there was none. {@code TunnelHealthMonitor} is a Dart
+     * {@code Timer.periodic} owned by {@code VpnController} in the Flutter process; the
+     * core runs here, in {@code :RunSoLibV2RayDaemon}, and outlives it. Measured on a MIUI
+     * tablet on 2026-08-31: app process gone, daemon up, 37 minutes of websocket timeouts
+     * to the web-proxy member and tuic timeouts to the entry, a VPN key icon and no
+     * internet — until a human opened the app, at which point the existing Dart logic
+     * fixed it in 21 seconds. The 21 seconds were never the problem.
+     *
+     * <p>Generation-tied and daemon, for the same two reasons as the proof watcher above:
+     * a tun rebuilt inside one process must not leave the old watcher judging the new
+     * tunnel, and nothing here may hold the process up on a kill.
+     */
+    private void startCarryWatchdog() {
+        final int generation = tunGeneration.get();
+        watchdog = newWatchdogPolicy();
+        final Thread t = new Thread(() -> {
+            try {
+                Thread.sleep(WATCHDOG_GRACE_MS);
+                while (watcherStillOwnsTunnel(generation)) {
+                    carryWatchdogTick(probeCarries(), appProcessAlive());
+                    Thread.sleep(WATCHDOG_POLL_MS);
+                }
+            } catch (InterruptedException ignored) {
+                // teardown
+            } catch (Throwable other) {
+                Log.w(TAG, "carry watchdog stopped", other);
+            }
+        }, "CarryWatchdog_Thread");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * May the watcher armed at [generation] keep judging what it sees?
+     *
+     * <p>⚠ A METHOD, SO THE GUARD CAN BE DRIVEN. It is one clause in a while loop and its
+     * absence has no symptom a test can see: every replay would leave ANOTHER watcher
+     * running, all of them probing, all of them counting, and N of them racing to replay
+     * the same tunnel — a restart loop built out of the thing that exists to prevent one.
+     * Asserting it through the thread instead measures the fixture: in the harness no
+     * tunnel ever carries, so every watcher exits within milliseconds either way.
+     */
+    boolean watcherStillOwnsTunnel(final int generation) {
+        return isRunning && generation == tunGeneration.get();
+    }
+
+    /**
+     * One evaluation. Package-private and taking its two inputs rather than reading them,
+     * so the harness can drive every branch without a network or a second process — the
+     * same seam {@link #restoreProofTick(long)} uses and for the same reason.
+     *
+     * @return what was done, for the harness and the log
+     */
+    TunnelWatchdogPolicy.Action carryWatchdogTick(final boolean carried, final boolean appAlive) {
+        final TunnelWatchdogPolicy policy = watchdog;
+        if (policy == null) {
+            return TunnelWatchdogPolicy.Action.NONE;
+        }
+        final TunnelWatchdogPolicy.Action action = policy.onProbe(carried, appAlive);
+        switch (action) {
+            case RESTART:
+                Log.w(TAG, "tunnel is up and carrying nothing, and no app process is there "
+                        + "to fix it => replaying the config (restart "
+                        + policy.restartsUsed() + ")");
+                replayConfigInPlace();
+                break;
+            case ALERT:
+                Log.e(TAG, "tunnel still carrying nothing after "
+                        + policy.restartsUsed() + " restarts => telling the user");
+                alertNotCarrying();
+                break;
+            default:
+                break;
+        }
+        return action;
+    }
+
+    /**
+     * Is the Flutter app process alive, i.e. is the Dart failover running?
+     *
+     * <p>{@code getRunningAppProcesses} has returned only the CALLER'S OWN processes since
+     * API 22, which is exactly the question being asked here — no permission, no
+     * cross-app visibility, and the answer is authoritative for our own package.
+     *
+     * <p>⚠ UNKNOWN MEANS ALIVE. Every failure path returns true, so a daemon that cannot
+     * tell does NOTHING. Two failovers racing each other is a worse outcome than one that
+     * arrives a minute late, and the app's is the one with the chain, the country list and
+     * the endpoint memory behind it.
+     *
+     * <p>Package-private so the harness can drive the REAL method against a fake
+     * ActivityManager: this one boolean decides whether the daemon ever acts, and a
+     * decision nobody can drive is a decision nobody can defend.
+     */
+    boolean appProcessAlive() {
+        try {
+            final android.app.ActivityManager am =
+                    (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) {
+                return true;
+            }
+            final java.util.List<android.app.ActivityManager.RunningAppProcessInfo> running =
+                    am.getRunningAppProcesses();
+            if (running == null) {
+                return true;
+            }
+            final String main = getPackageName();
+            for (final android.app.ActivityManager.RunningAppProcessInfo p : running) {
+                if (main.equals(p.processName)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            Log.w(TAG, "could not tell whether the app process is alive", t);
+            return true;
+        }
+    }
+
+    /** Does the tunnel carry anything, asked THROUGH the running core. */
+    private boolean probeCarries() {
+        try {
+            final Long delay = V2rayCoreManager.getInstance().getConnectedV2rayServerDelay();
+            return delay != null && delay > 0L;
+        } catch (Throwable t) {
+            Log.w(TAG, "carry probe threw", t);
+            return false;
+        }
+    }
+
+    /**
+     * Replay the config we are already running, through the path the app itself uses.
+     *
+     * <p>⚠ NOT {@code stopCore()} FOLLOWED BY {@code startCore()} FROM HERE.
+     * {@code stopCore()} calls {@code v2rayServicesListener.stopService()} — it takes the
+     * SERVICE down, not just the core — and on the app's path that is safe only because a
+     * fresh START intent is already in hand. Doing it from a watchdog thread would leave
+     * the user with no tunnel at all, which is the one outcome this class must never
+     * produce. Sending ourselves the same START_SERVICE the app sends reuses that whole
+     * vetted path: stop, start, persist, notification, new tun, new generation — and this
+     * watcher exits on the generation bump, with a fresh one started by {@link #setup()}.
+     *
+     * <p>What it buys: the config carries the entire balancer group, so a fresh
+     * {@code startCore} re-runs the urltest across every member and can land on one that
+     * is not black-holed. That is the cheapest thing that has ever fixed this shape.
+     */
+    private void replayConfigInPlace() {
+        final V2rayConfig cfg = v2rayConfig != null
+                ? v2rayConfig
+                : AutoStartStore.load(this, AutoStartStore.SLOT_VPN);
+        if (cfg == null) {
+            Log.w(TAG, "nothing to replay: no config in hand and none persisted");
+            return;
+        }
+        try {
+            final Intent again = new Intent(this, V2rayVPNService.class);
+            again.putExtra("COMMAND", AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE);
+            again.putExtra("V2RAY_CONFIG", cfg);
+            startService(again);
+        } catch (Throwable t) {
+            Log.w(TAG, "could not replay the config", t);
+        }
+    }
+
+    /**
+     * Tell the user the tunnel is not carrying, and leave the tunnel up.
+     *
+     * <p>⚠ THE TUNNEL STAYS. Failing closed leaves them with no internet; failing OPEN
+     * puts their traffic on the wire while they believe it is inside a tunnel. For this
+     * product the second is the worse harm, so the last resort is a sentence, not an
+     * exposure. The notification is the honest escape hatch: it turns "my internet died
+     * and I found out 37 minutes later" into "my phone told me and I tapped it".
+     *
+     * <p>Best-effort by construction. Without POST_NOTIFICATIONS on API 33+ this is a
+     * silent no-op, which is the same bargain the foreground notification already makes.
+     */
+    private void alertNotCarrying() {
+        try {
+            final NotificationManager nm =
+                    (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) {
+                return;
+            }
+            final String channelId = "A_FLUTTER_V2RAY_SERVICE_CH_ID";
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                // Same id the foreground notification uses, so this rides a channel the
+                // user has already seen and can silence on its own terms.
+                nm.createNotificationChannel(new NotificationChannel(
+                        channelId, "VPN", NotificationManager.IMPORTANCE_DEFAULT));
+            }
+            final Intent open = getPackageManager().getLaunchIntentForPackage(getPackageName());
+            android.app.PendingIntent tap = null;
+            if (open != null) {
+                open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                tap = android.app.PendingIntent.getActivity(
+                        this, 0, open,
+                        android.app.PendingIntent.FLAG_UPDATE_CURRENT
+                                | android.app.PendingIntent.FLAG_IMMUTABLE);
+            }
+            final NotificationCompat.Builder b = new NotificationCompat.Builder(this, channelId)
+                    .setSmallIcon(android.R.drawable.stat_notify_error)
+                    .setContentTitle("VPN is connected but not carrying traffic")
+                    .setContentText("Tap to reconnect.")
+                    .setAutoCancel(true)
+                    .setOnlyAlertOnce(true);
+            if (tap != null) {
+                b.setContentIntent(tap);
+            }
+            nm.notify(NOT_CARRYING_NOTIFICATION_ID, b.build());
+        } catch (Throwable t) {
+            Log.w(TAG, "could not post the not-carrying alert", t);
+        }
     }
 
     /** Total downlink bytes the core has counted since it was initialised; 0 on error. */

@@ -165,10 +165,30 @@ javac -nowarn -cp "$JSON_JAR" -d build/sclasses \
   ServiceHarness.java LosablePrefs.java \
   $(find stubs -name '*.java') \
   "$SRC/core/Tun2socksArgs.java" "$SRC/core/UnderlyingNetworkPolicy.java" \
+  "$SRC/core/TunnelWatchdogPolicy.java" \
   "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" "$SRC/utils/AppConfigs.java" \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/services/V2rayVPNService.java" "$SRC/services/V2rayProxyOnlyService.java" || exit 1
 run_harness services java -cp "build/sclasses:$JSON_JAR" ServiceHarness
+
+# ── the dead-tunnel detector that survives the app being killed ───────────────────
+# ⚠ THERE WAS NONE. `TunnelHealthMonitor` is a Dart Timer.periodic owned by the Flutter
+# process; the core runs in :RunSoLibV2RayDaemon and outlives it. Measured on a MIUI
+# tablet 2026-08-31: app process gone, daemon up, 37 minutes of websocket timeouts to the
+# web-proxy member and tuic timeouts to the entry, a VPN key icon and no internet — until
+# a human opened the app, whereupon the existing Dart logic fixed it in 21 seconds.
+# Reverting the `appAlive` guard, the restart budget, the alert latch or the counter that
+# survives an alive app each turns one of these red.
+echo
+javac -nowarn -cp "$JSON_JAR" -d build/wclasses \
+  WatchdogHarness.java LosablePrefs.java \
+  $(find stubs -name '*.java') \
+  "$SRC/core/Tun2socksArgs.java" "$SRC/core/UnderlyingNetworkPolicy.java" \
+  "$SRC/core/TunnelWatchdogPolicy.java" \
+  "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" "$SRC/utils/AppConfigs.java" \
+  "$SRC/interfaces/V2rayServicesListener.java" \
+  "$SRC/services/V2rayVPNService.java" "$SRC/services/V2rayProxyOnlyService.java" || exit 1
+run_harness watchdog java -cp "build/wclasses:$JSON_JAR" WatchdogHarness
 
 echo
 echo "──────────────────────────────────────────────────────────────"

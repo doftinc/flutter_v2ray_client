@@ -17,6 +17,17 @@ public class Context {
   public void sendBroadcast(Intent i){}
   /** The tunnel's own process asks for this to watch which network carries it. */
   public static final String CONNECTIVITY_SERVICE = "connectivity";
+  /** The carry watchdog asks these two: who is alive, and how do I tell the user. */
+  public static final String ACTIVITY_SERVICE = "activity";
+  public static final String NOTIFICATION_SERVICE = "notification";
+  /** Counts the START_SERVICE the watchdog sends itself, and keeps the last one. */
+  public static int startServiceCalls = 0;
+  public static Intent lastStartService = null;
+  public static void resetStartService(){ startServiceCalls = 0; lastStartService = null; }
+  public void startService(Intent i){ startServiceCalls++; lastStartService = i; }
+  public android.content.pm.PackageManager getPackageManager(){
+    return new android.content.pm.PackageManager();
+  }
   /**
    * ⚠ A SINGLETON, LIKE THE REAL ONE. Handing back a fresh instance per call made the
    * register and the unregister land on DIFFERENT objects, so a test could watch the
@@ -29,6 +40,8 @@ public class Context {
       if (cm == null) cm = new android.net.ConnectivityManager();
       return cm;
     }
+    if (ACTIVITY_SERVICE.equals(name)) return new android.app.ActivityManager();
+    if (NOTIFICATION_SERVICE.equals(name)) return new android.app.NotificationManager();
     return null;
   }
 }

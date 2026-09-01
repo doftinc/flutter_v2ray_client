@@ -337,6 +337,50 @@ public class ServiceHarness {
      * PROOF_DOWNLINK_BYTES, then one tick of the proof. ⚠ THE TWO HALVES ARE SEPARATE ON
      * PURPOSE - a black hole gives you the first and never the second.
      */
+    /**
+     * Wait until the service's teardown lane is idle. Generously bounded: this is the
+     * suite making itself deterministic, not the property under test.
+     *
+     * <p>⚠ EVERY STOP IN THIS FILE NEEDS IT NOW. The teardown moved off the caller's
+     * thread, so a check written straight after {@code onStartCommand(STOP_SERVICE)} is
+     * racing it. It passed anyway on the machine this was written on, which is exactly
+     * the kind of green that means nothing.
+     */
+    static boolean joinLane(V2rayVPNService s) {
+        return (Boolean) call(s, "joinTeardown", new Class<?>[] { long.class }, 10000L);
+    }
+
+    /**
+     * Wedge the lane shut until the returned latch is opened.
+     *
+     * <p>⚠ THE ONLY DETERMINISTIC WAY TO ASK "DID THIS RUN SYNCHRONOUSLY". Gating
+     * {@code stopCore} parks the lane INSIDE the teardown, so anything a regression moved
+     * onto the lane AHEAD of stopCore has already run by the time the check looks — a
+     * mutation that deferred onRevoke's AutoStartStore.clear() survived a suite that
+     * could only gate stopCore. A barrier queued FIRST means nothing the callback posts
+     * can have happened at all.
+     */
+    static java.util.concurrent.CountDownLatch wedgeLane(V2rayVPNService s) {
+        final java.util.concurrent.CountDownLatch open = new java.util.concurrent.CountDownLatch(1);
+        call(s, "offTheMainThread", new Class<?>[] { String.class, Runnable.class },
+                "harness barrier", (Runnable) () -> {
+                    try {
+                        open.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+        return open;
+    }
+
+    /** The bound a start waits for an in-flight teardown before refusing it. */
+    static void joinBudget(long ms) {
+        privSet(null, V2rayVPNService.class, "TEARDOWN_JOIN_MS", ms);
+    }
+
+    static final long JOIN_BUDGET_DEFAULT =
+            (Long) priv(null, V2rayVPNService.class, "TEARDOWN_JOIN_MS");
+
     static void restoreAndProve(TestVpn s) {
         VpnService.establishResult = new ParcelFileDescriptor();
         s.startService();
@@ -508,6 +552,7 @@ public class ServiceHarness {
             TestVpn s = new TestVpn(disk);
             userStart(s, config(null));
             s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+            joinLane(s);
             check("STOP_SERVICE clears the slot", !disk.hasVpnBlob(), "blob survived the stop");
             check("STOP_SERVICE clears the credential-bearing blob",
                     disk.config().map.get("vpn_config") == null, "still stored");
@@ -755,6 +800,7 @@ public class ServiceHarness {
             check("armed before the revoke", disk.hasVpnBlob(), "nothing stored");
 
             s.onRevoke();
+            joinLane(s);
             check("onRevoke drops the credential-bearing blob", !disk.hasVpnBlob(), "still stored");
             check("onRevoke stops the core", !V2rayCoreManager.coreRunning, "core still running");
             check("onRevoke stops the service for real", s.stopSelfCalled, "service left alive");
@@ -1471,8 +1517,291 @@ public class ServiceHarness {
             // reference, so a stop that skipped the unregister would leak one per connect
             // and keep declaring for a tunnel that no longer exists.
             s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+            joinLane(s);
             check("service: stopping unregisters the callback",
                     cm.unregisterCalls > 0, "unregister=" + cm.unregisterCalls);
+        });
+
+        // 31. THE TEARDOWN THAT FROZE THE DAEMON.
+        //
+        //     Reported 2026-08-31: Disconnect does nothing for ten taps, then "the app is
+        //     not responding"; Connect afterwards reports connected with no internet and
+        //     "— KB/s" where the counters belong. The service lives in
+        //     :RunSoLibV2RayDaemon and every stop ran WHOLE on that process's main thread
+        //     — stopLoop() into Go, stopTuic(), process.destroy(), mInterface.close() —
+        //     while three things needed that same looper: the 1 Hz stats tick, the NEXT
+        //     onStartCommand, and the ANR watchdog.
+        //
+        //     ⚠ THE EXISTING 134 CHECKS PASS WITH THE TEARDOWN EITHER WAY. They assert on
+        //     state the stop leaves behind, and a fast stub leaves it behind on any
+        //     thread. Nothing below asks about state; each one asks WHEN.
+        run(() -> {
+            resetWorld();
+            joinBudget(JOIN_BUDGET_DEFAULT);
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+
+            java.util.concurrent.CountDownLatch gate = new java.util.concurrent.CountDownLatch(1);
+            V2rayCoreManager.stopCoreGate = gate;
+            int r = s.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+
+            // The whole property, stated once: we are back on this thread and the teardown
+            // is provably not finished.
+            check("a stop RETURNS while its teardown is still running",
+                    !V2rayCoreManager.stopCoreFinished, "the teardown completed inline");
+            check("a stop still answers START_STICKY",
+                    r == android.app.Service.START_STICKY, "returned " + r);
+            // ⚠ AND THE BOOKKEEPING IS STILL SYNCHRONOUS. "An explicit stop is final"
+            // (case 5) rests on the slot being clear the instant we return; deferring it
+            // onto the lane would leave a window in which a kill resurrects the tunnel
+            // the user just switched off.
+            check("a stop clears the auto-start slot BEFORE it returns",
+                    !disk.hasVpnBlob(), "blob survived only because the lane got there");
+
+            // Give the lane a moment to actually pick the work up, then prove it did.
+            long deadline = System.currentTimeMillis() + 5000L;
+            while (!V2rayCoreManager.stopCoreEntered && System.currentTimeMillis() < deadline) {
+                try { Thread.sleep(5L); } catch (InterruptedException ignored) { }
+            }
+            check("the teardown was HANDED to the lane, not skipped",
+                    V2rayCoreManager.stopCoreEntered, "stopCore was never entered");
+            check("and it runs on the lane, not on the caller",
+                    "v2ray-teardown".equals(V2rayCoreManager.stopCoreThread),
+                    "ran on " + V2rayCoreManager.stopCoreThread);
+
+            // ⚠ A START MAY NOT WALK INTO A TEARDOWN. stopAllProcess() ends in
+            // mInterface.close(), mInterface = null and stopSelf(); a start that raced it
+            // would build a tun the teardown then closes — "connected, no internet" again,
+            // by a new route. Refusing is the answer, and the app's ladder retries.
+            joinBudget(150L);
+            int startCoresBefore = V2rayCoreManager.startCoreCalls;
+            int r2 = s.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, config(null)), 0, 3);
+            check("a start into a stuck teardown is REFUSED",
+                    r2 == android.app.Service.START_NOT_STICKY, "returned " + r2);
+            check("and it does not start a core into one",
+                    V2rayCoreManager.startCoreCalls == startCoresBefore,
+                    "startCore ran " + (V2rayCoreManager.startCoreCalls - startCoresBefore) + " time(s)");
+
+            // Release it. The teardown must still complete — a lane that swallowed the
+            // work would leave the tunnel up with the app believing it is down.
+            gate.countDown();
+            V2rayCoreManager.stopCoreGate = null;
+            check("the lane drains once the teardown can finish", joinLane(s), "still busy");
+            check("and the teardown really happened", V2rayCoreManager.stopCoreFinished,
+                    "stopCore never finished");
+
+            // And the very next start behaves exactly as it always did.
+            joinBudget(JOIN_BUDGET_DEFAULT);
+            TestVpn s2 = new TestVpn(disk);
+            int r3 = s2.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, config(null)), 0, 4);
+            check("a start after the lane drained is unchanged",
+                    r3 == android.app.Service.START_STICKY, "returned " + r3);
+            check("and it did start the core",
+                    V2rayCoreManager.startCoreCalls == startCoresBefore + 1,
+                    "startCore calls " + V2rayCoreManager.startCoreCalls);
+        });
+
+        // 31b. THE WINDOW AFTER THE CORE FLAG IS ALREADY CLEAR.
+        //
+        //      ⚠ THE CASE ABOVE DOES NOT PROVE THE START-PATH GUARD, AND A MUTATION SAID
+        //      SO. Parking stopCore at its ENTRY leaves isV2rayCoreRunning() true, so a
+        //      start is refused by the "replace a running core" branch — the first guard
+        //      could be deleted outright and the suite stayed green. The real stopLoop()
+        //      clears that flag before it returns, which is precisely when a start walks
+        //      past every later check and into stopAllProcess()'s mInterface.close(),
+        //      mInterface = null and stopSelf(). That is "connected, no internet" again,
+        //      built by the fix instead of by the bug.
+        run(() -> {
+            resetWorld();
+            joinBudget(150L);
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+
+            java.util.concurrent.CountDownLatch late = new java.util.concurrent.CountDownLatch(1);
+            V2rayCoreManager.stopCoreLateGate = late;
+            s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+
+            long deadline = System.currentTimeMillis() + 5000L;
+            while (V2rayCoreManager.coreRunning && System.currentTimeMillis() < deadline) {
+                try { Thread.sleep(5L); } catch (InterruptedException ignored) { }
+            }
+            check("the teardown clears the core flag before the tun is closed",
+                    !V2rayCoreManager.coreRunning, "flag still set — the window never opened");
+
+            int startsBefore = V2rayCoreManager.startCoreCalls;
+            int r = s.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, config(null)), 0, 3);
+            check("a start is refused even once the core flag is clear",
+                    r == android.app.Service.START_NOT_STICKY, "returned " + r);
+            check("and it builds no tunnel into a teardown that is still closing one",
+                    V2rayCoreManager.startCoreCalls == startsBefore,
+                    "startCore ran " + (V2rayCoreManager.startCoreCalls - startsBefore) + " time(s)");
+
+            late.countDown();
+            V2rayCoreManager.stopCoreLateGate = null;
+            joinLane(s);
+            joinBudget(JOIN_BUDGET_DEFAULT);
+        });
+
+        // 32. onDestroy() WAITS FOR THE LANE INSTEAD OF RACING IT.
+        //
+        //     stopAllProcess() runs ON the lane and ends in stopSelf(), which is what
+        //     brings the framework to onDestroy() — so onDestroy can arrive while that
+        //     same teardown is between stopSelf() and mInterface.close(). Its body is
+        //     null-guarded and safe to run twice; running it CONCURRENTLY is what is not.
+        run(() -> {
+            resetWorld();
+            joinBudget(JOIN_BUDGET_DEFAULT);
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+
+            // ⚠ THE **LATE** GATE, AND `laneStopFinished`, FOR THE SAME REASON AS 31b.
+            // Parked at the entry, the core flag is still set, so an onDestroy that had
+            // deleted its wait would call stopCore() ITSELF, block on the same gate and
+            // come back with stopCoreFinished true — the check passing on the mutant's
+            // own inline work. Parked LATE the flag is already clear, so onDestroy's own
+            // `if (isV2rayCoreRunning())` skips: the only way the lane's teardown can be
+            // finished when onDestroy returns is if onDestroy waited for it.
+            java.util.concurrent.CountDownLatch late = new java.util.concurrent.CountDownLatch(1);
+            V2rayCoreManager.stopCoreLateGate = late;
+            s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+
+            long deadline = System.currentTimeMillis() + 5000L;
+            while (V2rayCoreManager.coreRunning && System.currentTimeMillis() < deadline) {
+                try { Thread.sleep(5L); } catch (InterruptedException ignored) { }
+            }
+
+            // Someone else lets the teardown finish shortly after onDestroy starts waiting.
+            final java.util.concurrent.CountDownLatch g = late;
+            Thread opener = new Thread(() -> {
+                try { Thread.sleep(120L); } catch (InterruptedException ignored) { }
+                g.countDown();
+            }, "gate-opener");
+            opener.setDaemon(true);
+            opener.start();
+
+            s.onDestroy();
+            check("onDestroy does not return until the lane is quiet",
+                    V2rayCoreManager.laneStopFinished,
+                    "onDestroy raced a teardown that had not finished");
+            V2rayCoreManager.stopCoreLateGate = null;
+        });
+
+        // 33. A SYSTEM-INITIATED RESTORE TAKES THE SAME EXCLUSION — AND DOES NOT PAY FOR IT.
+        //
+        //     A sticky restart or an always-on start can land in a process where the
+        //     user's stop is still draining. The restore has to wait for the same reason
+        //     the user's start does. ⚠ AND THE WAIT SITS AHEAD OF beginRestoreAttempt():
+        //     a teardown we are waiting out is no more the config's fault than a consent
+        //     with nobody to ask, and case 4 already refuses to charge the budget for
+        //     that. Written below the budget first; this case is what caught it.
+        run(() -> {
+            resetWorld();
+            joinBudget(150L);
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));                 // arms the slot, core running
+            int failuresBefore = disk.vpnFailures();
+
+            // Park the teardown LATE — flag clear, tun not yet closed — using the start
+            // path's own "replace a running core" teardown, because a STOP would clear
+            // the very slot the restore is supposed to find.
+            java.util.concurrent.CountDownLatch late = new java.util.concurrent.CountDownLatch(1);
+            V2rayCoreManager.stopCoreLateGate = late;
+            s.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, config(null)), 0, 3);
+            long deadline = System.currentTimeMillis() + 5000L;
+            while (V2rayCoreManager.coreRunning && System.currentTimeMillis() < deadline) {
+                try { Thread.sleep(5L); } catch (InterruptedException ignored) { }
+            }
+            check("the slot survives a start that was refused", disk.hasVpnBlob(), "slot cleared");
+
+            int startsBefore = V2rayCoreManager.startCoreCalls;
+            int failuresAtRefusal = disk.vpnFailures();
+            int r = stickyRestart(s);
+            check("a restore into a draining teardown is refused",
+                    r == android.app.Service.START_NOT_STICKY, "returned " + r);
+            check("and it starts no core into one",
+                    V2rayCoreManager.startCoreCalls == startsBefore,
+                    "startCore ran " + (V2rayCoreManager.startCoreCalls - startsBefore) + " time(s)");
+            check("and the refusal is not charged to the config's restore budget",
+                    disk.vpnFailures() == failuresAtRefusal,
+                    "budget went " + failuresAtRefusal + " -> " + disk.vpnFailures()
+                            + " (started at " + failuresBefore + ")");
+
+            late.countDown();
+            V2rayCoreManager.stopCoreLateGate = null;
+            joinLane(s);
+            joinBudget(JOIN_BUDGET_DEFAULT);
+        });
+
+        // 34. onRevoke() IS A MAIN-THREAD FRAMEWORK CALLBACK TOO.
+        //
+        //     It is the other way the user says no, and it ran the whole of
+        //     stopAllProcess() — process.destroy(), mInterface.close(), stopCore() — on
+        //     the thread the framework called it on. Case 16 proves the EFFECT; this one
+        //     proves the timing, which case 16 cannot see because it joins first.
+        run(() -> {
+            resetWorld();
+            joinBudget(JOIN_BUDGET_DEFAULT);
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+
+            // A BARRIER, not a gate inside stopCore — see wedgeLane. Nothing onRevoke
+            // hands the lane can have run when it returns, so every check below is about
+            // what onRevoke itself did on the calling thread.
+            java.util.concurrent.CountDownLatch open = wedgeLane(s);
+            s.onRevoke();
+            check("onRevoke RETURNS before its teardown has even started",
+                    !V2rayCoreManager.stopCoreEntered, "the teardown ran inline");
+            // ⚠ And the consent bookkeeping is still synchronous, for the same reason the
+            // stop's is: nothing may restore a tunnel whose consent has just gone, and
+            // between the return and the lane there is a window in which a kill would.
+            check("onRevoke clears the slot before it returns", !disk.hasVpnBlob(),
+                    "blob survived — the clear was deferred onto the lane");
+
+            open.countDown();
+            joinLane(s);
+            check("and the revoke's teardown still happens", V2rayCoreManager.laneStopFinished,
+                    "the lane never finished it");
+        });
+
+        // 35. A LANE THAT CANNOT ACCEPT WORK MUST NOT DROP IT.
+        //
+        //     onDestroy() shuts the lane down. Anything that arrives afterwards would be
+        //     rejected, and a rejection handled by logging is a tunnel left up with the
+        //     app believing it is down — strictly worse than the synchronous teardown
+        //     this whole change replaced. The fallback is to run it inline, i.e. to
+        //     degrade to exactly what shipped before.
+        run(() -> {
+            resetWorld();
+            joinBudget(JOIN_BUDGET_DEFAULT);
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+            s.onDestroy();                        // shuts the lane down
+            joinLane(s);
+
+            V2rayCoreManager.coreRunning = true;  // a core is up again
+            V2rayCoreManager.stopCoreCalls = 0;
+            V2rayCoreManager.stopCoreFinished = false;
+            s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 3);
+            // TWO, not one — the documented two-deep recursion the stub models and the
+            // real core has: stopCore() -> stopService() -> stopAllProcess() -> stopCore(),
+            // whose second call takes the "not running" branch. Asserting 1 here was my
+            // arithmetic, not the code's.
+            check("a shut-down lane runs the teardown inline instead of dropping it",
+                    V2rayCoreManager.stopCoreCalls == 2,
+                    "stopCore ran " + V2rayCoreManager.stopCoreCalls + " time(s)");
+            check("and the core really is stopped", !V2rayCoreManager.coreRunning,
+                    "a core is still running after the user stopped it");
         });
 
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));

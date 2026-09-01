@@ -41,10 +41,40 @@ public class V2rayCoreManager {
    */
   public static long totalDownloadBytes = 0L;
 
+  /**
+   * Held open, stopCore() parks here before it does anything — the only way to ask "did
+   * onStartCommand return while the teardown was still running", which is the whole
+   * property the teardown lane exists to provide. Bounded so a broken test cannot hang
+   * the suite; run.sh cannot tell a hang from a slow machine.
+   */
+  public static volatile java.util.concurrent.CountDownLatch stopCoreGate = null;
+  /** Set on ENTRY, so "started" and "finished" are separately observable. */
+  public static volatile boolean stopCoreEntered = false;
+  public static volatile boolean stopCoreFinished = false;
+  /** Which thread ran it. A teardown on the caller's thread is the defect itself. */
+  public static volatile String stopCoreThread = "";
+  /**
+   * The LATE gate: held, stopCore() parks AFTER it has cleared the running flag and
+   * before the listener callback that closes the tun and stops the service.
+   *
+   * <p>⚠ THIS IS THE DANGEROUS WINDOW, AND ONLY THE LATE GATE CAN OPEN IT. The real
+   * stopLoop() clears the flag before it returns, so a start arriving here sees
+   * isV2rayCoreRunning() == false and walks straight past the "replace a running core"
+   * branch — while stopAllProcess() is still ahead of it with mInterface.close(),
+   * mInterface = null and stopSelf(). Two mutations survived a suite that could only
+   * park stopCore at its ENTRY: the start-path guard and onDestroy's wait were both
+   * being proved by a DIFFERENT guard that happened to fire first.
+   */
+  public static volatile java.util.concurrent.CountDownLatch stopCoreLateGate = null;
+  /** Set only by the lane thread, so "the lane finished" cannot be satisfied inline. */
+  public static volatile boolean laneStopFinished = false;
+
   public static void reset(){
     coreRunning = false; startCoreResult = true; startCoreCalls = 0;
     stopCoreCalls = 0; stopServiceCallbacks = 0; lastConfig = null; listener = null;
     totalDownloadBytes = 0L;
+    stopCoreGate = null; stopCoreEntered = false; stopCoreFinished = false;
+    stopCoreThread = ""; stopCoreLateGate = null; laneStopFinished = false;
   }
 
   public long getTotalDownloadBytes(){ return totalDownloadBytes; }
@@ -60,13 +90,35 @@ public class V2rayCoreManager {
 
   public void stopCore(){
     stopCoreCalls++;
+    stopCoreEntered = true;
+    stopCoreThread = Thread.currentThread().getName();
+    final java.util.concurrent.CountDownLatch gate = stopCoreGate;
+    if (gate != null) {
+      try {
+        gate.await(10, java.util.concurrent.TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
     final boolean wasRunning = coreRunning;
     // stopLoop() clears the flag before anything below runs; without this the callback
     // below would recurse forever.
     coreRunning = false;
+    final java.util.concurrent.CountDownLatch late = stopCoreLateGate;
+    if (late != null) {
+      try {
+        late.await(10, java.util.concurrent.TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
     if (wasRunning && listener instanceof V2rayServicesListener) {
       stopServiceCallbacks++;
       ((V2rayServicesListener) listener).stopService();
+    }
+    stopCoreFinished = true;
+    if ("v2ray-teardown".equals(Thread.currentThread().getName())) {
+      laneStopFinished = true;
     }
   }
 

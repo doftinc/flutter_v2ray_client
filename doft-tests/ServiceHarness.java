@@ -1854,6 +1854,49 @@ public class ServiceHarness {
                     "claimed the exclusion held on a shut-down lane");
         });
 
+        // 46b. A RE-DIAL REPLACES THE RUNNING CORE, IT DOES NOT STACK A SECOND ONE.
+        //
+        //      ⚠ NOTHING PINNED THIS, AND THE ROUND-5 MUTATION RUN SAID SO: deleting the
+        //      whole `if (isV2rayCoreRunning()) stopCore();` from the start branch left
+        //      292 assertions green. The behaviour predates the teardown lane, but this
+        //      change MOVED that line — it was briefly handed to the lane and joined —
+        //      so it now has a test whichever way it is written.
+        //
+        //      What it protects: switchNode() and every failover send a START with no
+        //      STOP in front of it. Without the replacement, startLoop() runs against a
+        //      CoreController that is already looping — a second core over the same tun,
+        //      with the old node's outbounds still installed.
+        //
+        //      ⚠ AND INLINE IS DELIBERATE. joinTeardown() ran one line above, so the lane
+        //      is empty; this thread has to hold the core still until startCore() replaces
+        //      it, and handing the stop to the lane only to wait for it again would buy
+        //      nothing but a second way for the two to interleave. So the assertion is
+        //      about the caller's thread, not about the lane.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+            check("a core is up before the re-dial", V2rayCoreManager.coreRunning, "no core");
+
+            int offLaneBefore = V2rayCoreManager.stopCoreCallsOffLane;
+            int startsBefore = V2rayCoreManager.startCoreCalls;
+            int r = s.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, config(null)), 0, 2);
+
+            check("a re-dial stops the running core first",
+                    V2rayCoreManager.stopCoreCallsOffLane > offLaneBefore,
+                    "the old core was never stopped — two cores over one tun");
+            check("and then starts the new one",
+                    V2rayCoreManager.startCoreCalls == startsBefore + 1,
+                    "startCore ran " + (V2rayCoreManager.startCoreCalls - startsBefore) + " time(s)");
+            check("and the re-dial succeeds", r == android.app.Service.START_STICKY,
+                    "returned " + r);
+            check("the replacement runs on the caller, not the lane",
+                    !"v2ray-teardown".equals(V2rayCoreManager.stopCoreThread),
+                    "ran on " + V2rayCoreManager.stopCoreThread);
+        });
+
         // 47. THE STATS TICKER IS CANCELLED BEFORE THE CORE IS CLOSED, NOT AFTER.
         //
         //     ⚠ THIS ONE CANNOT BE RUN HERE, AND SAYING SO IS THE POINT. V2rayCoreManager

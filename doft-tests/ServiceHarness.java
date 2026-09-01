@@ -373,7 +373,26 @@ public class ServiceHarness {
         return open;
     }
 
-    /** A production source file, read from disk. Only case 47 uses it — see its note. */
+    /**
+     * A source file with its line comments removed.
+     *
+     * ⚠ THE COMMENTS ARE PART OF THE PROBLEM, NOT BACKGROUND. A structural check that
+     * searches raw text finds the explanation before the code: the note above the
+     * MEASURE_DELAY branch names `getConnectedV2rayServerDelay` two lines before the call
+     * that runs it, so "the probe comes after the lane" read FALSE on correct code. In a
+     * file where the comments outweigh the statements, any ordering check has to look at
+     * the statements.
+     */
+    static String readCode(String relative) {
+        StringBuilder out = new StringBuilder();
+        for (String ln : readSource(relative).split("\n", -1)) {
+            int i = ln.indexOf("//");
+            out.append(i >= 0 ? ln.substring(0, i) : ln).append("\n");
+        }
+        return out.toString();
+    }
+
+    /** A production source file, read from disk. See case 47's note. */
     static String readSource(String relative) {
         try {
             return new String(java.nio.file.Files.readAllBytes(
@@ -2013,7 +2032,7 @@ public class ServiceHarness {
         //     `native`, not synchronized. Cancelling first removes the window instead of
         //     asking Go to tolerate it.
         run(() -> {
-            String src = readSource(
+            String src = readCode(
                     "../android/src/main/java/dev/amirzr/flutter_v2ray_client/v2ray/core/"
                             + "V2rayCoreManager.java");
             int body = src.indexOf("public void stopCore()");
@@ -2045,8 +2064,139 @@ public class ServiceHarness {
                     src.indexOf("stopping = true", body) > 0
                             && src.indexOf("stopping = true", body) < stop,
                     "the flag is not raised before the core is closed");
-            check("and a start clears it, or the ticker never comes back",
-                    src.indexOf("stopping = false") > 0, "nothing clears `stopping`");
+            // ⚠ AFTER startCore(), NOT ANYWHERE. `private volatile boolean stopping =
+            // false;` is a field initialiser and answered this check for free, so deleting
+            // the assignment in startCore left it green — and a `stopping` nothing clears
+            // means the ticker never comes back after the first stop.
+            int sc = src.indexOf("public boolean startCore(");
+            check("startCore() is where this file says it is", sc > 0, "method not found");
+            int clear = src.indexOf("stopping = false", sc);
+            int tags = src.indexOf("statsTags = readOutboundTags", sc);
+            // ⚠ AND THE ONE THING THAT TELLS THE APP THE TUNNEL IS DOWN MUST SURVIVE A
+            // THROW. The Go shutdown() callback NULLS v2rayServicesListener and stopLoop()
+            // is what triggers it, so an NPE on `listener.stopService()` was swallowed by
+            // the catch as an ordinary Exception — and took sendDisconnectedBroadCast()
+            // with it. The app then never received V2RAY_DISCONNECTED and its UI stayed
+            // "connected" over a torn-down tunnel: the worst shape available, because it
+            // is the one a user cannot tell from a working one.
+            //
+            // ⚠ "AFTER stopTuic()" IS NOT THE TEST, AND MY FIRST VERSION USED IT — a
+            // mutant that moved the call back INSIDE the try was still after stopTuic and
+            // stayed green. The catch's own log line is the last thing in the block, so
+            // "after that" is what actually means "outside it".
+            // ⚠ THE CALL, NOT THE DECLARATION. `private void sendDisconnectedBroadCast()`
+            // sits BELOW stopCore() in this file, so searching without the semicolon found
+            // the method's own definition — and a mutant that deleted the CALL outright
+            // stayed green, because the definition is still there and still after the
+            // catch. A structural check that matches the thing it is looking for by name
+            // rather than by shape finds the wrong occurrence sooner or later.
+            int announce = src.indexOf("sendDisconnectedBroadCast();", body);
+            // ⚠ THE CATCH'S LOG, AND ONLY IT. `"stopCore failed => v2ray core not
+            // running."` is a DIFFERENT line, inside the try, and it shares this prefix —
+            // so anchoring on the prefix let a mutant that moved the call back inside the
+            // try (after that line) still read as "outside". The catch's is the one that
+            // passes the exception.
+            int caught = src.indexOf("\"stopCore failed =>\", e)", body);
+            int guarded = src.indexOf("if (listener != null)", body);
+            check("the listener is null-guarded before it is called",
+                    guarded > 0 && announce > 0 && guarded < announce,
+                    "a shutdown racing stopLoop() NPEs and swallows the disconnect");
+            check("the disconnect is announced OUTSIDE the try that can throw",
+                    announce > 0 && caught > 0 && announce > caught,
+                    "sendDisconnectedBroadCast is still reachable only on the happy path");
+
+            check("a start clears the flag, or the ticker never comes back",
+                    clear > 0 && tags > 0 && clear < tags,
+                    "startCore does not clear `stopping` before it rebuilds the ticker");
+        });
+
+        // 48. TWO ORDERINGS THIS HARNESS CANNOT EXECUTE, PINNED IN THE SOURCE.
+        //
+        //     Both were found by a mutation run surviving: the checks below exist because
+        //     the behavioural ones could not be written here, not instead of writing them.
+        //
+        //     * THE TUN2SOCKS WATCHER'S GENERATION GUARD needs a real tun2socks binary to
+        //       exit and re-enter; this JVM has none (every run prints "Cannot run program
+        //       /nonexistent-doft-test-libs/libtun2socks.so"). What it protects: the
+        //       watcher re-enters runTun2socks() on its own thread, holds nothing, and is
+        //       NOT on the teardown lane — so it can pass its own `isRunning` check
+        //       microseconds before stopAllProcess() clears it and then respawn tun2socks
+        //       against the config the NEXT start published. `isRunning` alone cannot see
+        //       that; `tunGeneration` is bumped by every setup() that establishes an
+        //       interface, which is exactly "a different tunnel from the one I belong to".
+        //
+        //     * THE DELAY PROBE ON THE LANE. MEASURE_DELAY ends in
+        //       coreController.measureDelay() on the same object stopLoop() is closing.
+        //       The stub's getConnectedV2rayServerDelay() returns -1 immediately, so no
+        //       assertion here can tell which thread it ran on.
+        run(() -> {
+            String src = readCode(
+                    "../android/src/main/java/dev/amirzr/flutter_v2ray_client/v2ray/"
+                            + "services/V2rayVPNService.java");
+            int watcher = src.indexOf("\"Tun2socks_Thread\"");
+            check("the tun2socks watcher is where this file says it is", watcher > 0,
+                    "thread not found");
+            int body = src.lastIndexOf("new Thread(", watcher);
+            String block = body > 0 ? src.substring(body, watcher) : "";
+            check("the watcher checks the generation it belongs to, not only isRunning",
+                    block.contains("tunGeneration.get()"),
+                    "a watcher from the old tunnel can respawn against the new config");
+            check("and it waits on the process it started, not on whatever the field holds",
+                    block.contains("mine.waitFor()"),
+                    "`process` is read again after another thread may have replaced it");
+
+            int measure = src.indexOf("MEASURE_DELAY");
+            check("the MEASURE_DELAY branch is where this file says it is", measure > 0,
+                    "branch not found");
+            int probe = src.indexOf("getConnectedV2rayServerDelay", measure);
+            int lane = src.indexOf("offTheMainThread", measure);
+            check("the delay probe is ordered against the teardown lane",
+                    lane > 0 && probe > 0 && lane < probe,
+                    "measureDelay() can run against a CoreController stopLoop() is closing");
+        });
+
+        // 49. onDestroy() UNREGISTERS THE NETWORK CALLBACK TOO, NOT ONLY stopAllProcess().
+        //
+        //     The framework holds a NetworkCallback until it is unregistered, so every
+        //     destruction that did NOT come through stopAllProcess() — the core already
+        //     stopped, an external stopService(), a start that failed after setup() —
+        //     leaked one, each still calling setUnderlyingNetworks on a tunnel that no
+        //     longer exists. One per connect, for the life of the process.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            // ⚠ resetWorld() DOES NOT TOUCH THE CONNECTIVITY FAKE, so `last` and its
+            // counters carry across cases. Without this, the "a callback was registered"
+            // check passes on a callback some EARLIER case registered and the case proves
+            // nothing about this service at all — which is exactly what it did first time.
+            if (android.net.ConnectivityManager.last != null) {
+                android.net.ConnectivityManager.last.reset();
+            }
+            userStart(s, config(null));
+            // ⚠ DRIVEN DIRECTLY, BECAUSE setup() CANNOT LEAVE ONE REGISTERED HERE. This
+            // harness has no tun2socks binary, so runTun2socks() always throws and its
+            // catch runs stopAllProcess() — which unregisters on the way out. Going
+            // through setup() therefore ends with nothing registered, and the case would
+            // pass on an onDestroy that does nothing. The property under test is "a
+            // callback that IS registered does not survive onDestroy", so the case
+            // registers one the same way production does and then destroys the service.
+            call(s, "watchUnderlyingNetwork", new Class<?>[] { });
+            android.net.ConnectivityManager cm = android.net.ConnectivityManager.last;
+            check("this tunnel registered a network callback",
+                    cm != null && cm.registerCalls > 0,
+                    "nothing to leak — this case can no longer see the defect");
+            check("and it is still registered going into onDestroy",
+                    priv(s, V2rayVPNService.class, "netCb") != null, "already gone");
+
+            // The core is ALREADY stopped, so onDestroy takes neither the stopAllProcess
+            // path nor the lane: exactly the destruction that used to leak.
+            V2rayCoreManager.coreRunning = false;
+            int before = cm.unregisterCalls;
+            s.onDestroy();
+            check("onDestroy unregisters it even with no core to stop",
+                    cm.unregisterCalls > before,
+                    "the callback outlived the service that registered it");
         });
 
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));

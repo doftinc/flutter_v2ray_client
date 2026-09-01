@@ -952,6 +952,12 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
     public void onDestroy() {
         Log.i("V2rayVPNService", "onDestroy called - cleaning up resources");
         isRunning = false;
+        // ⚠ HERE TOO, NOT ONLY IN stopAllProcess(). The framework holds a NetworkCallback
+        // until it is unregistered, and every destruction that did not come through
+        // stopAllProcess() — the core already stopped, an external stopService(), a
+        // failed start — left one behind. One leaked callback per connect, each still
+        // calling setUnderlyingNetworks on a tunnel that no longer exists.
+        unwatchUnderlyingNetwork();
         // ⚠ WAIT, DO NOT RACE, AND WAIT WITHOUT A BOUND. stopAllProcess() on the lane
         // ends in stopSelf(), which is what brings the framework here — so this callback
         // can arrive while that same teardown is between stopSelf() and

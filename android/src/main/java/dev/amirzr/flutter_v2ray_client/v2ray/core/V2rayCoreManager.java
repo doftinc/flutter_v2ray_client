@@ -366,14 +366,35 @@ public final class V2rayCoreManager {
                     Libv2ray.stopTuic();
                 } catch (Throwable ignored) {
                 }
-                v2rayServicesListener.stopService();
+                // ⚠ NULL-GUARDED, AND THE BROADCAST BELOW MOVED OUT OF ITS REACH.
+                // The Go `shutdown()` callback NULLS this field, and stopLoop() is what
+                // triggers it — so a shutdown that lands before this line threw an NPE
+                // here, the catch below swallowed it as an ordinary Exception, and
+                // sendDisconnectedBroadCast() was SKIPPED. The app then never received
+                // V2RAY_DISCONNECTED and its UI stayed "connected" over a torn-down
+                // tunnel: the worst of the failure shapes, because it is the one the user
+                // cannot tell from a working one. Pre-existing, and widened by reading
+                // this field from the teardown lane rather than from the looper that
+                // wrote it.
+                final V2rayServicesListener listener = v2rayServicesListener;
+                if (listener != null) {
+                    listener.stopService();
+                }
                 Log.e(V2rayCoreManager.class.getSimpleName(), "stopCore success => v2ray core stopped.");
             } else {
                 Log.e(V2rayCoreManager.class.getSimpleName(), "stopCore failed => v2ray core not running.");
             }
-            sendDisconnectedBroadCast();
         } catch (Exception e) {
             Log.e(V2rayCoreManager.class.getSimpleName(), "stopCore failed =>", e);
+        }
+        // ⚠ OUTSIDE THE try, AND UNCONDITIONALLY. This is the only thing that tells the
+        // app the tunnel is down; leaving it inside meant any throw above — an NPE, a
+        // dead binder, anything libv2ray raises — took the notification with it and left
+        // the UI reporting a tunnel that no longer exists.
+        try {
+            sendDisconnectedBroadCast();
+        } catch (Exception e) {
+            Log.w("V2rayCoreManager", "Failed to announce the disconnect", e);
         }
     }
 

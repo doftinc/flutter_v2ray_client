@@ -43,7 +43,21 @@ public final class V2rayCoreManager {
     private CoreController coreController;
     public AppConfigs.V2RAY_STATES V2RAY_STATE = AppConfigs.V2RAY_STATES.V2RAY_DISCONNECTED;
     private boolean isLibV2rayCoreInitialized = false;
-    private CountDownTimer countDownTimer;
+    // volatile: cancelled from the service's teardown lane, re-armed on the daemon looper.
+    private volatile CountDownTimer countDownTimer;
+    /**
+     * Set for the whole of {@link #stopCore}, and the reason the ticker cannot come back.
+     *
+     * <p>⚠ CANCELLING THE TIMER IS NOT ENOUGH, BECAUSE IT RE-ARMS ITSELF. `onFinish()` runs
+     * every 7.2 s and builds a NEW CountDownTimer whenever `isV2rayCoreRunning()` — which
+     * is TRUE for the whole of `stopLoop()`. A cancel that lands while the looper is inside
+     * the final `handleMessage` therefore kills a timer that has already been replaced, and
+     * the replacement calls `coreController.queryStats()` once a second for the entire
+     * remaining stop: exactly the window the cancel exists to close, reopened by the
+     * object's own lifecycle. The window is small (microseconds out of 7.2 s) and it is the
+     * only UNBOUNDED one, which is the kind worth a flag.
+     */
+    private volatile boolean stopping = false;
     private int seconds, minutes, hours;
     private long totalDownload, totalUpload, uploadSpeed, downloadSpeed;
     /**
@@ -130,8 +144,12 @@ public final class V2rayCoreManager {
             }
 
             public void onFinish() {
-                countDownTimer.cancel();
-                if (V2rayCoreManager.getInstance().isV2rayCoreRunning())
+                cancel();
+                // ⚠ AND `stopping`, NOT ONLY `isV2rayCoreRunning()`. The running flag stays
+                // TRUE for the whole of stopLoop(), so this re-armed the ticker in the
+                // middle of a teardown — see the field.
+                if (!V2rayCoreManager.getInstance().stopping
+                        && V2rayCoreManager.getInstance().isV2rayCoreRunning())
                     makeDurationTimer(context, enable_traffic_statics);
             }
         }.start();
@@ -208,6 +226,9 @@ public final class V2rayCoreManager {
     }
 
     public boolean startCore(final V2rayConfig v2rayConfig) {
+        // A start is the end of any stop: clear the flag BEFORE makeDurationTimer, or the
+        // ticker this call is about to build would refuse to re-arm itself for ever.
+        stopping = false;
         statsTags = readOutboundTags(v2rayConfig.V2RAY_FULL_JSON_CONFIG);
         makeDurationTimer(v2rayServicesListener.getService().getApplicationContext(),
                 v2rayConfig.ENABLE_TRAFFIC_STATICS);
@@ -292,6 +313,7 @@ public final class V2rayCoreManager {
     }
 
     public void stopCore() {
+        stopping = true;
         // ⚠⚠ THE TICKER STOPS FIRST, BEFORE ANY OF THE TEARDOWN BELOW.
         //
         // This used to be cancelled at the very END, inside sendDisconnectedBroadCast(),

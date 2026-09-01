@@ -1605,6 +1605,7 @@ public class ServiceHarness {
             TestVpn s = new TestVpn(disk);
             userStart(s, config(null));
             int startsBefore = V2rayCoreManager.startCoreCalls;
+            int offLaneBefore = V2rayCoreManager.stopCoreCallsOffLane;
 
             java.util.concurrent.CountDownLatch open = wedgeLane(s);
             s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
@@ -1635,6 +1636,17 @@ public class ServiceHarness {
             check("and it starts no core into one",
                     V2rayCoreManager.startCoreCalls == startsBefore,
                     "startCore ran " + (V2rayCoreManager.startCoreCalls - startsBefore) + " time(s)");
+            // ⚠⚠ AND IT HAS NOT TORN ANYTHING DOWN ON ITS OWN THREAD EITHER. A MUTANT
+            // SURVIVED BOTH CHECKS ABOVE: moving the inline "replace a running core"
+            // stopCore() from AFTER joinTeardown() to BEFORE it leaves the start blocked
+            // and startCore unreached — both assertions still green — while the caller's
+            // thread has meanwhile run a COMPLETE teardown of the same core, on the
+            // daemon's main looper, which is the entire thing this change exists to stop.
+            // The two checks above pin only where startCore sits.
+            check("and it has not run a teardown on the caller's thread",
+                    V2rayCoreManager.stopCoreCallsOffLane == offLaneBefore,
+                    "stopCore ran " + (V2rayCoreManager.stopCoreCallsOffLane - offLaneBefore)
+                            + " time(s) OFF the lane while the start was waiting");
 
             open.countDown();
             try {
@@ -1887,6 +1899,12 @@ public class ServiceHarness {
             dial.start();
 
             // Long enough that a start which published first would have done so by now.
+            // ⚠ AND THE FIELD IS `volatile`, WHICH IS WHAT MAKES THIS A TEST. Read from a
+            // third thread off a plain field, a STALE value is indistinguishable from an
+            // ordered one — the pass value and the bug's value are the same observation.
+            // The publication the production code needs is a visibility property, so the
+            // field carries one; without it neither this assertion nor the tun2socks
+            // watcher it protects would mean anything.
             try { Thread.sleep(300L); } catch (InterruptedException ignored) { }
             Object live = priv(s, V2rayVPNService.class, "v2rayConfig");
             check("the field still names the tunnel that is coming down",
@@ -1906,24 +1924,61 @@ public class ServiceHarness {
                             + (after instanceof V2rayConfig ? ((V2rayConfig) after).REMARK : after));
         });
 
-        // 46b. A RE-DIAL REPLACES THE RUNNING CORE, IT DOES NOT STACK A SECOND ONE.
+        // 46b. THE "REPLACE A RUNNING CORE" BRANCH HAS NO PRODUCTION CALLER, AND IF IT
+        //      EVER GETS ONE IT WILL NOT DO WHAT ITS NAME SAYS.
         //
-        //      ⚠ NOTHING PINNED THIS, AND THE ROUND-5 MUTATION RUN SAID SO: deleting the
-        //      whole `if (isV2rayCoreRunning()) stopCore();` from the start branch left
-        //      292 assertions green. The behaviour predates the teardown lane, but this
-        //      change MOVED that line — it was briefly handed to the lane and joined —
-        //      so it now has a test whichever way it is written.
+        //      ⚠⚠ MY FIRST VERSION OF THIS CASE BLESSED IT AS A WORKING RE-DIAL. Both
+        //      halves of that were wrong, and an adversarial pass showed it:
         //
-        //      What it protects: switchNode() and every failover send a START with no
-        //      STOP in front of it. Without the replacement, startLoop() runs against a
-        //      CoreController that is already looping — a second core over the same tun,
-        //      with the old node's outbounds still installed.
+        //      * THE PREMISE. The comment said "switchNode() and every failover send a
+        //        START with no STOP in front of it". They do not. `v2ray_vpn_bridge.dart`
+        //        sends stopV2Ray() and sleeps 400 ms before EVERY start, and switchNode()
+        //        in vpn_controller.dart additionally awaits a teardown first. Since the
+        //        start now joins the lane, the core is always already stopped by the time
+        //        this branch is evaluated — so the case was pinning a path nothing takes.
         //
-        //      ⚠ AND INLINE IS DELIBERATE. joinTeardown() ran one line above, so the lane
-        //      is empty; this thread has to hold the core still until startCore() replaces
-        //      it, and handing the stop to the lane only to wait for it again would buy
-        //      nothing but a second way for the two to interleave. So the assertion is
-        //      about the caller's thread, not about the lane.
+        //      * THE OUTCOME. `stopCore()` on the stub, exactly as on the device, calls
+        //        back through stopService() into stopAllProcess() — which closes the tun,
+        //        nulls mInterface and calls stopSelf(). A start that reaches this branch
+        //        therefore starts a core into a service the framework is about to destroy,
+        //        and onDestroy() then stops that core again. "The re-dial succeeds" was
+        //        asserted about a sequence that ends with no tunnel and no service.
+        //
+        //      So this case pins the two things that are actually true: the production
+        //      sequence does NOT reach the branch, and the branch is not a working re-dial.
+        //      Deleting the branch is a separate change with its own reasoning; leaving it
+        //      undocumented is what let a test bless it.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            userStart(s, config(null));
+
+            // The production sequence, in order: a stop, then a start.
+            int offLaneBefore = V2rayCoreManager.stopCoreCallsOffLane;
+            int startsBefore = V2rayCoreManager.startCoreCalls;
+            s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+            joinLane(s);
+            int r = s.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, config(null)), 0, 3);
+
+            check("the ordinary stop-then-start reaches no re-dial branch",
+                    V2rayCoreManager.stopCoreCallsOffLane == offLaneBefore,
+                    "stopCore ran " + (V2rayCoreManager.stopCoreCallsOffLane - offLaneBefore)
+                            + " time(s) on the caller — the branch was taken after all");
+            check("and it starts the core normally",
+                    V2rayCoreManager.startCoreCalls == startsBefore + 1,
+                    "startCore ran " + (V2rayCoreManager.startCoreCalls - startsBefore) + " time(s)");
+            check("and answers START_STICKY", r == android.app.Service.START_STICKY,
+                    "returned " + r);
+        });
+
+        // 46c. AND WHAT THE BRANCH WOULD DO, MEASURED RATHER THAN ASSUMED.
+        //
+        //      Reached only by forcing the state the production sequence cannot produce:
+        //      a START while the core is genuinely still running. The point is not that
+        //      this is good — it is that the record says what it costs, so the next person
+        //      to consider relying on it has the measurement instead of the name.
         run(() -> {
             resetWorld();
             Disk disk = new Disk();
@@ -1931,22 +1986,15 @@ public class ServiceHarness {
             userStart(s, config(null));
             check("a core is up before the re-dial", V2rayCoreManager.coreRunning, "no core");
 
-            int offLaneBefore = V2rayCoreManager.stopCoreCallsOffLane;
-            int startsBefore = V2rayCoreManager.startCoreCalls;
-            int r = s.onStartCommand(
+            s.onStartCommand(
                     command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, config(null)), 0, 2);
 
-            check("a re-dial stops the running core first",
-                    V2rayCoreManager.stopCoreCallsOffLane > offLaneBefore,
-                    "the old core was never stopped — two cores over one tun");
-            check("and then starts the new one",
-                    V2rayCoreManager.startCoreCalls == startsBefore + 1,
-                    "startCore ran " + (V2rayCoreManager.startCoreCalls - startsBefore) + " time(s)");
-            check("and the re-dial succeeds", r == android.app.Service.START_STICKY,
-                    "returned " + r);
-            check("the replacement runs on the caller, not the lane",
-                    !"v2ray-teardown".equals(V2rayCoreManager.stopCoreThread),
-                    "ran on " + V2rayCoreManager.stopCoreThread);
+            check("the branch tears the SERVICE down, not just the core",
+                    s.stopSelfCalled,
+                    "stopSelf was not called — the note above is out of date");
+            check("and it closes the tun the new core was about to use",
+                    priv(s, V2rayVPNService.class, "mInterface") == null,
+                    "mInterface survived — the note above is out of date");
         });
 
         // 47. THE STATS TICKER IS CANCELLED BEFORE THE CORE IS CLOSED, NOT AFTER.
@@ -1978,6 +2026,27 @@ public class ServiceHarness {
             check("the ticker is cancelled BEFORE the core is closed", cancel < stop,
                     "cancel at " + cancel + ", stopLoop at " + stop
                             + " — a stats tick can now call queryStats() on a closing core");
+
+            // ⚠ AND CANCELLING IS NOT ENOUGH, BECAUSE THE TIMER RE-ARMS ITSELF. onFinish()
+            // runs every 7.2 s and builds a NEW CountDownTimer whenever the core reads as
+            // running — which it does for the whole of stopLoop(). A cancel landing while
+            // the looper is in the final handleMessage kills a timer that has already been
+            // replaced, and the replacement calls queryStats() once a second for the rest
+            // of the stop: the same window, reopened by the object's own lifecycle. So the
+            // re-arm has to consult a flag that is true for the whole teardown.
+            int fin = src.indexOf("public void onFinish()");
+            check("the duration timer still re-arms itself", fin > 0, "onFinish not found");
+            int guard = src.indexOf("stopping", fin);
+            int rearm = src.indexOf("makeDurationTimer", fin);
+            check("the re-arm is gated on a teardown flag, not only on the running core",
+                    guard > 0 && rearm > 0 && guard < rearm,
+                    "onFinish re-arms without consulting `stopping`");
+            check("`stopping` is set for the whole of stopCore()",
+                    src.indexOf("stopping = true", body) > 0
+                            && src.indexOf("stopping = true", body) < stop,
+                    "the flag is not raised before the core is closed");
+            check("and a start clears it, or the ticker never comes back",
+                    src.indexOf("stopping = false") > 0, "nothing clears `stopping`");
         });
 
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));

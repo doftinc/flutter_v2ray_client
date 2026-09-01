@@ -29,12 +29,18 @@ import java.util.Arrays;
 
 public class V2rayVPNService extends VpnService implements V2rayServicesListener {
     private static final String TAG = "V2rayVPNService";
-    // volatile: the tun2socks watcher thread re-enters runTun2socks() and the sendFd
-    // thread reads the descriptor, while stopAllProcess() may be clearing both from
-    // whichever thread the core called back on.
+    // ⚠ volatile ON ALL THREE, AND THE COMMENT HERE USED TO CLAIM IT COVERED "BOTH"
+    // WHILE ONLY ONE HAD IT. Every one of these is written on the framework's main thread
+    // and read or cleared from another: the tun2socks watcher re-enters runTun2socks(),
+    // the sendFd thread reads the descriptor, and since the teardown moved onto its own
+    // lane, stopAllProcess() nulls `process` and `mInterface` from there while a start
+    // may already be publishing new ones. `v2rayConfig` joined them when the start began
+    // publishing it behind joinTeardown(): a publication nothing can observe is not a
+    // publication, and the test that pinned the ordering was doing a racy read whose
+    // STALE answer was its pass value.
     private volatile ParcelFileDescriptor mInterface;
-    private Process process;
-    private V2rayConfig v2rayConfig;
+    private volatile Process process;
+    private volatile V2rayConfig v2rayConfig;
     private volatile boolean isRunning = true;
 
     /**
@@ -283,7 +289,10 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             // SECOND wait — an earlier version had two joins here and could spend 8 s
             // before the notification, on a ~10 s deadline. One join, and only when a
             // teardown is genuinely in flight.
-            joinTeardown();
+            if (!joinTeardown()) {
+                Log.w(TAG, "starting without the teardown exclusion — the lane could not "
+                        + "be joined; a teardown may still be running");
+            }
             v2rayConfig = incoming;
             if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
                 // A start with no stop in front of it — a re-dial onto a different node.
@@ -316,17 +325,37 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             // restart, not always-on.
             AutoStartStore.clear(this, AutoStartStore.SLOT_VPN);
         } else if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.MEASURE_DELAY)) {
-            new Thread(() -> {
-                try {
-                    String packageName = getPackageName();
-                    Intent sendB = new Intent(packageName + ".CONNECTED_V2RAY_SERVER_DELAY");
-                    sendB.setPackage(packageName);
-                    sendB.putExtra("DELAY", String.valueOf(V2rayCoreManager.getInstance().getConnectedV2rayServerDelay()));
-                    sendBroadcast(sendB);
-                } catch (Exception e) {
-                    Log.w("V2rayVPNService", "Failed to send delay broadcast", e);
+            // ⚠ ON THE LANE, NOT ON A THREAD OF ITS OWN. This ends in
+            // coreController.measureDelay() — the SAME CoreController a teardown is
+            // closing with stopLoop(), and neither is synchronized. While the stop owned
+            // this looper the two could not interleave, because the MEASURE intent could
+            // not even be dequeued during one; the lane made them genuinely parallel, and
+            // this is the second consumer of that object after the stats ticker.
+            //
+            // Ordering it behind the teardown is also the only answer that makes sense on
+            // its own terms: a latency sample taken while the core is shutting down is not
+            // a latency sample. It stays off the looper either way, which is all the
+            // original thread was buying.
+            //
+            // ⚠ Unreachable from this app today — vpn-app calls only the config-based
+            // getServerDelay — but it is public plugin API (flutter_v2ray.dart), and
+            // V2rayController.getConnectedV2rayServerDelay guards only on the APP
+            // process's view of the connection state, which says nothing about this one.
+            offTheMainThread("measure delay", new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        String packageName = getPackageName();
+                        Intent sendB = new Intent(packageName + ".CONNECTED_V2RAY_SERVER_DELAY");
+                        sendB.setPackage(packageName);
+                        sendB.putExtra("DELAY", String.valueOf(
+                                V2rayCoreManager.getInstance().getConnectedV2rayServerDelay()));
+                        sendBroadcast(sendB);
+                    } catch (Exception e) {
+                        Log.w("V2rayVPNService", "Failed to send delay broadcast", e);
+                    }
                 }
-            }, "MEASURE_CONNECTED_V2RAY_SERVER_DELAY").start();
+            });
         } else {
             return stopCleanly("unknown command received");
         }
@@ -349,7 +378,10 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         // it just declined to rebuild. An always-on device would come back with no tunnel
         // and nothing left to bring it back. Same exclusion the user-initiated start
         // takes, and it costs nothing when the lane is idle.
-        joinTeardown();
+        if (!joinTeardown()) {
+            Log.w(TAG, "restoring without the teardown exclusion — the lane could not "
+                    + "be joined; a teardown may still be running");
+        }
 
         // Idempotent. The framework re-sends the always-on start intent, and tearing a
         // healthy tunnel down to rebuild it would be a self-inflicted outage.
@@ -836,11 +868,28 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         try {
             ProcessBuilder processBuilder = new ProcessBuilder(cmd);
             processBuilder.redirectErrorStream(true);
-            process = processBuilder.directory(getApplicationContext().getFilesDir()).start();
+            // ⚠ CAPTURE THE GENERATION AND THE PROCESS, THE WAY THE PROOF WATCHER
+            // ALREADY DOES. `isRunning` alone is not an exclusion: this watcher is NOT on
+            // the teardown lane and holds nothing, so it can pass its own `if (isRunning)`
+            // microseconds before stopAllProcess() clears it — and then respawn tun2socks
+            // against whatever config the NEXT start has published, overwrite `process`
+            // with a relay the new tunnel does not know about, and send the fd a second
+            // time. Two relays on one tun through one socket path, and the orphan survives
+            // every later teardown because nothing holds a reference to it.
+            //
+            // The shape predates the lane: `stopAllProcess()` used to run on the same
+            // looper as the next onStartCommand, so the two could not actually interleave.
+            // They can now, which makes an accidental ordering into a guard that has to be
+            // written down. `tunGeneration` is bumped by every setup() that establishes an
+            // interface, which is exactly "a different tunnel from the one I belong to".
+            final int myGeneration = tunGeneration.get();
+            final Process mine = processBuilder
+                    .directory(getApplicationContext().getFilesDir()).start();
+            process = mine;
             new Thread(() -> {
                 try {
-                    process.waitFor();
-                    if (isRunning) {
+                    mine.waitFor();
+                    if (isRunning && myGeneration == tunGeneration.get()) {
                         runTun2socks();
                     }
                 } catch (InterruptedException e) {
@@ -910,6 +959,18 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         // running it CONCURRENTLY with the lane is what is not. The lane never waits on
         // this thread, so this cannot deadlock.
         //
+        // ⚠ TWO THINGS THIS CALLBACK STILL DOES ON THE DAEMON'S MAIN THREAD, NAMED SO
+        // THEY ARE NOT MISTAKEN FOR SOLVED:
+        //  * IT NOW BLOCKS WHERE IT DID NOT. A stopLoop() that never returns used to wedge
+        //    onStartCommand; it wedges this too. Same outcome (a Service Timeout ANR), but
+        //    it is a new blocking framework callback and the change did not have one.
+        //  * THE stopCore() BELOW IS STILL SYNCHRONOUS AND STILL HERE. Every destruction
+        //    that did NOT come through the STOP branch or onRevoke reaches it with the core
+        //    running — an external Context.stopService(), or stopCleanly() after startCore
+        //    threw past startLoop(). Those paths keep the old behaviour exactly; the thesis
+        //    of this change is "the USER'S stop is off this thread", not "no teardown ever
+        //    runs on it".
+        //
         // ⚠⚠ AND THE BOUND THAT USED TO BE HERE HAD TWO TEETH. On timeout this method
         // went on to call stopCore() ITSELF while the lane was still inside stopLoop() —
         // a second, concurrent teardown of the same core, on the very thread this change
@@ -921,7 +982,14 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         // and stopSelf()-ing a healthy tunnel. Waiting here is what makes the lane's
         // lifetime a subset of the service's, which is the only reason nothing else in
         // this class has to reason about cross-instance teardowns.
-        joinTeardown();
+        if (!joinTeardown()) {
+            // ⚠ AND WE SHUT THE LANE DOWN ANYWAY, WHICH IS THE HAZARD THE WAIT ABOVE
+            // EXISTS TO PREVENT. Reachable only if this thread is interrupted; there is
+            // nothing better to do here (blocking a destroyed service forever is worse),
+            // so it is logged rather than pretended away.
+            Log.w(TAG, "destroying with the teardown lane un-joined — a teardown may "
+                    + "outlive this service instance");
+        }
         teardownLane.shutdown();
         
         // Stop the V2ray core

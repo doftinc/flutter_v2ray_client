@@ -24,10 +24,16 @@ import dev.amirzr.flutter_v2ray_client.v2ray.utils.V2rayConfig;
  * <p>It is not fixed here because nothing reaches it: the app has exactly one call site,
  * {@code lib/v2ray_vpn_bridge.dart}, and it passes {@code proxyOnly: false} unconditionally, so
  * {@code AppConfigs.V2RAY_CONNECTION_MODE} is always {@code VPN_TUN} and both
- * {@code V2rayController.StartV2ray} and {@code StopV2ray} address the VPN service. Giving this
- * class its own lane would mean a second teardown lane against one shared core singleton — two
- * of them could then run {@code stopLoop()} concurrently, which is worse than the wedge it would
- * remove — and it would rework the proxy cases in doft-tests for a path no user takes.
+ * {@code V2rayController.StartV2ray} and {@code StopV2ray} address the VPN service.
+ *
+ * <p>⚠ AND THE REASON THIS NOTE FIRST GAVE WAS WRONG. It argued that a second lane would let
+ * two {@code stopLoop()}s run concurrently on the shared singleton — but that is already true:
+ * this class calls {@code stopCore()} synchronously on the shared daemon main thread, so it can
+ * already race the VPN service's lane on the same process-wide object. Leaving it alone does not
+ * avoid the concurrent teardown; it only decides which of the two is the wedge. The decision
+ * holds on unreachability alone, which is a fact about the app and not an argument about
+ * threading — so if that fact ever changes, this class needs the VPN service's lane (not one of
+ * its own, because the thing being torn down is one object for the whole process).
  *
  * <p>⚠ SO IF THIS SERVICE EVER BECOMES REACHABLE, IT NEEDS THE FIX FIRST. Not its own lane: it
  * must share the VPN service's, or serialise against it, because the thing being torn down is

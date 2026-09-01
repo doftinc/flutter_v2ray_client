@@ -29,13 +29,36 @@ SRC=../android/src/main/java/dev/amirzr/flutter_v2ray_client/v2ray
 JSON_JAR="${JSON_JAR:-build/json.jar}"
 mkdir -p build
 if [ ! -s "$JSON_JAR" ]; then
-  curl -sSL -o "$JSON_JAR" https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
+  # ⚠ DOWNLOAD ASIDE, THEN RENAME. Two runs starting together both saw an absent jar and
+  # both wrote the same path; the loser compiled against a half-written archive. `mv` on
+  # one filesystem is atomic, so the worst case is now one wasted download.
+  curl -sSL -o "$JSON_JAR.$$" https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar \
+    && mv -f "$JSON_JAR.$$" "$JSON_JAR"
+  rm -f "$JSON_JAR.$$"
 fi
-# ⚠ EVERY OUTPUT DIRECTORY THIS SCRIPT COMPILES INTO. `build/pclasses` (the protector
-# harness, compiled below) was missing, so stale classes survived a local rerun and a
-# deleted test could keep passing from the previous build.
-rm -rf build/classes build/tclasses build/aclasses build/sclasses build/uclasses \
-       build/nclasses build/pclasses && mkdir -p build/classes
+
+# ⚠⚠ EVERY OUTPUT OF THIS RUN LIVES IN A DIRECTORY THIS RUN OWNS, AND IT USED NOT TO. The
+# class directories and the per-harness `.out` files were fixed names under `build/`, and
+# the first thing this script did was `rm -rf` them — so two suites started at once in ONE
+# checkout deleted each other's classes and overwrote each other's output. Measured:
+#
+#     A:  TOTAL: 332 assertions, 0 failed, 0 harness(es) broken   (rc 0)
+#     B:  TOTAL: 122 assertions, 0 failed, 0 harness(es) broken   (rc 0)
+#
+# — while B's own RESULT lines summed to 332. Both exited 0. That is the same shape as the
+# fixture paths fixed in 8556673, one level up: the fixtures were made private to the JVM
+# and the BUILD TREE was left shared, so "the suite can run twice on one machine" was true
+# only for sequential reruns. (CI was never affected: check-plugin-tests.sh clones into its
+# own mktemp directory. It was the claim that was wrong, not the gate.)
+#
+# `build/json.jar` stays shared on purpose — it is a 60 KB download, it is written
+# atomically above, and it is only ever read afterwards.
+OUT="build/run-$$"
+rm -rf "$OUT"
+mkdir -p "$OUT/classes"
+# The harnesses' stdout is echoed as it is read, so nothing here is worth keeping after the
+# summary; leaving it behind is how a shared /tmp fills up one gate run at a time.
+trap 'rm -rf "$OUT"' EXIT INT TERM
 
 TOTAL_CHECKS=0
 TOTAL_FAILURES=0
@@ -44,7 +67,7 @@ BROKEN=0
 # Run one harness, echo everything it prints, and add its RESULT line to the totals.
 run_harness() {
   local label="$1"; shift
-  local out="build/${label}.out"
+  local out="$OUT/${label}.out"
   if ! "$@" >"$out" 2>&1; then
     : # a non-zero exit is expected when a harness reports failures; the RESULT line rules
   fi
@@ -63,13 +86,13 @@ run_harness() {
 }
 
 # ── endpoint resolution ───────────────────────────────────────────────────────────
-javac -nowarn -cp "$JSON_JAR" -d build/classes \
+javac -nowarn -cp "$JSON_JAR" -d "$OUT/classes" \
   Harness.java \
   $(find stubs -name '*.java') \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/core/Tun2socksArgs.java" \
   "$SRC/utils/Utilities.java" "$SRC/utils/AppConfigs.java" "$SRC/utils/V2rayConfig.java" || exit 1
-run_harness endpoints java -cp "build/classes:$JSON_JAR" Harness
+run_harness endpoints java -cp "$OUT/classes:$JSON_JAR" Harness
 
 # ── TUIC config rewrite ───────────────────────────────────────────────────────────
 # ⚠ THE ONE THAT CAN LEAK. When the TUIC listener does not come up, this decides
@@ -78,12 +101,12 @@ run_harness endpoints java -cp "build/classes:$JSON_JAR" Harness
 # believes is tunnelled leaves in clear. Removing the fail-closed branch makes two of
 # these fail, naming `freedom` as outbounds[0].
 echo
-javac -nowarn -cp "$JSON_JAR" -d build/tclasses \
+javac -nowarn -cp "$JSON_JAR" -d "$OUT/tclasses" \
   TuicRewriteHarness.java \
   stubs/android/util/Log.java \
   "$SRC/core/Tun2socksArgs.java" \
   "$SRC/core/TuicConfigRewriter.java" || exit 1
-run_harness tuic java -cp "build/tclasses:$JSON_JAR" \
+run_harness tuic java -cp "$OUT/tclasses:$JSON_JAR" \
   dev.amirzr.flutter_v2ray_client.v2ray.core.TuicRewriteHarness
 
 # ── socket protection ──────────────────────────────────────────────────────────────
@@ -94,12 +117,12 @@ run_harness tuic java -cp "build/tclasses:$JSON_JAR" \
 # protected. There was not one assertion about any of this, and the VpnService stub's
 # hard-coded `protect() -> true` meant none could be written.
 echo
-javac -nowarn -cp "$JSON_JAR" -d build/pclasses \
+javac -nowarn -cp "$JSON_JAR" -d "$OUT/pclasses" \
   ProtectorHarness.java \
   $(find stubs -name '*.java') \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/core/SocketProtector.java" || exit 1
-run_harness protector java -cp "build/pclasses:$JSON_JAR" \
+run_harness protector java -cp "$OUT/pclasses:$JSON_JAR" \
   dev.amirzr.flutter_v2ray_client.v2ray.core.ProtectorHarness
 
 # ── the tun2socks command line ────────────────────────────────────────────────────
@@ -112,13 +135,13 @@ run_harness protector java -cp "build/pclasses:$JSON_JAR" \
 # needs a live VpnService. Reverting Tun2socksArgs to emit `--enable-udprelay` by default
 # turns this red.
 echo
-javac -nowarn -cp "$JSON_JAR" -d build/uclasses \
+javac -nowarn -cp "$JSON_JAR" -d "$OUT/uclasses" \
   Tun2socksHarness.java \
   $(find stubs -name '*.java') \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/core/Tun2socksArgs.java" \
   "$SRC/utils/Utilities.java" "$SRC/utils/AppConfigs.java" "$SRC/utils/V2rayConfig.java" || exit 1
-run_harness tun2socks java -cp "build/uclasses:$JSON_JAR" Tun2socksHarness
+run_harness tun2socks java -cp "$OUT/uclasses:$JSON_JAR" Tun2socksHarness
 
 # ── which network carries the tunnel ──────────────────────────────────────────────
 # ⚠ THE DAEMON HAD NO CONNECTIVITY AWARENESS AT ALL. The tunnel runs in its own process and
@@ -127,10 +150,10 @@ run_harness tun2socks java -cp "build/uclasses:$JSON_JAR" Tun2socksHarness
 # handover happened with nothing in the tunnel's process noticing and setUnderlyingNetworks
 # was never called. Loosening any leg of the rule below turns this red.
 echo
-javac -nowarn -cp "$JSON_JAR" -d build/nclasses \
+javac -nowarn -cp "$JSON_JAR" -d "$OUT/nclasses" \
   UnderlyingNetworkHarness.java \
   "$SRC/core/UnderlyingNetworkPolicy.java" || exit 1
-run_harness underlying-network java -cp "build/nclasses:$JSON_JAR" UnderlyingNetworkHarness
+run_harness underlying-network java -cp "$OUT/nclasses:$JSON_JAR" UnderlyingNetworkHarness
 
 # ── autostart store ───────────────────────────────────────────────────────────────
 # ⚠ THE ONE THAT DECIDES WHAT A START WE DID NOT MAKE DOES. Android hands a sticky
@@ -145,13 +168,13 @@ run_harness underlying-network java -cp "build/nclasses:$JSON_JAR" UnderlyingNet
 # is the only way to see that a budget charged with apply() is not charged at all when
 # the attempt it is bounding kills the process.
 echo
-javac -nowarn -cp "$JSON_JAR" -d build/aclasses \
+javac -nowarn -cp "$JSON_JAR" -d "$OUT/aclasses" \
   AutoStartHarness.java LosablePrefs.java \
   $(find stubs -name '*.java') \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/core/Tun2socksArgs.java" \
   "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" || exit 1
-run_harness autostart java -cp "build/aclasses:$JSON_JAR" AutoStartHarness
+run_harness autostart java -cp "$OUT/aclasses:$JSON_JAR" AutoStartHarness
 
 # ── the two services themselves ───────────────────────────────────────────────────
 # ⚠ AN EARLIER ROUND SHIPPED THESE WITH NO TEST OVER THEM. Reverting both service files
@@ -165,14 +188,14 @@ run_harness autostart java -cp "build/aclasses:$JSON_JAR" AutoStartHarness
 # `this.onDestroy()` used as a stop (it cleans up and leaves the service alive).
 # Reverting either service file turns this run red.
 echo
-javac -nowarn -cp "$JSON_JAR" -d build/sclasses \
+javac -nowarn -cp "$JSON_JAR" -d "$OUT/sclasses" \
   ServiceHarness.java LosablePrefs.java \
   $(find stubs -name '*.java') \
   "$SRC/core/Tun2socksArgs.java" "$SRC/core/UnderlyingNetworkPolicy.java" \
   "$SRC/utils/AutoStartStore.java" "$SRC/utils/V2rayConfig.java" "$SRC/utils/AppConfigs.java" \
   "$SRC/interfaces/V2rayServicesListener.java" \
   "$SRC/services/V2rayVPNService.java" "$SRC/services/V2rayProxyOnlyService.java" || exit 1
-run_harness services java -cp "build/sclasses:$JSON_JAR" ServiceHarness
+run_harness services java -cp "$OUT/sclasses:$JSON_JAR" ServiceHarness
 
 echo
 echo "──────────────────────────────────────────────────────────────"

@@ -466,8 +466,17 @@ public class ServiceHarness {
             if (dir != null) {
                 return dir;
             }
-            java.io.File d = new java.io.File(System.getProperty("java.io.tmpdir"), "doft-fake-tun2socks");
-            d.mkdirs();
+            // ⚠ A DIRECTORY THIS JVM OWNS, NOT A FIXED NAME UNDER java.io.tmpdir. On Linux
+            // that property is `/tmp` — shared by every user and every CI job on the host,
+            // and kept between jobs on a self-hosted runner — so the Files.write below
+            // landed on a copy an earlier run had left, threw AccessDeniedException, and
+            // killed this case before its first assertion. The suite came back 315/1 on the
+            // runner while eighteen consecutive local runs were 316/0, because on macOS
+            // java.io.tmpdir is a PER-USER directory under /var/folders and the collision
+            // cannot happen there. The gate that runs this suite at the pinned ref is what
+            // surfaced it; nothing else was ever going to.
+            java.io.File d = java.nio.file.Files.createTempDirectory("doft-fake-tun2socks").toFile();
+            d.deleteOnExit();
             log = new java.io.File(d, "execs.log");
             log.delete();
             java.io.File bin = new java.io.File(d, "libtun2socks.so");
@@ -475,8 +484,9 @@ public class ServiceHarness {
                     ("#!/bin/sh\nprintf 'x\\n' >> '" + log.getAbsolutePath() + "'\nsleep 0.05\n")
                             .getBytes(java.nio.charset.StandardCharsets.UTF_8));
             bin.setExecutable(true, false);
-            // runTun2socks() runs the binary with getFilesDir() as its working directory.
-            new java.io.File("/tmp/doft-assets").mkdirs();
+            // runTun2socks() runs the binary with getFilesDir() as its working directory —
+            // which is now the stub Context's own per-JVM directory, for the same reason.
+            android.content.Context.ASSETS.mkdirs();
             dir = d;
             return d;
         }
@@ -2197,6 +2207,45 @@ public class ServiceHarness {
             check("onDestroy unregisters it even with no core to stop",
                     cm.unregisterCalls > before,
                     "the callback outlived the service that registered it");
+        });
+
+        // 50. THE FIXTURES LIVE SOMEWHERE THIS JVM OWNS, NOT IN A SHARED NAMESPACE.
+        //
+        //     ⚠ THIS IS THE ONE THAT ONLY FAILED SOMEWHERE ELSE. Both fixture paths were
+        //     fixed names — `${java.io.tmpdir}/doft-fake-tun2socks` and the literal
+        //     `/tmp/doft-assets`. On macOS java.io.tmpdir is a PER-USER directory under
+        //     /var/folders, so eighteen consecutive local runs were 316/0. On Linux it is
+        //     `/tmp`: shared by every user and every job on the host, and kept BETWEEN jobs
+        //     on a self-hosted runner. Writing the fake libtun2socks.so over a copy an
+        //     earlier run had left threw AccessDeniedException, the case died before its
+        //     first assertion, and the suite came back 315 assertions with 1 failure —
+        //     one fewer than it should run, which is the signature of a case that threw.
+        //
+        //     It took a gate that runs this suite at the pinned ref to see it at all. This
+        //     case is so that the next person does not need one.
+        run(() -> {
+            String tmp = System.getProperty("java.io.tmpdir");
+            java.io.File assets = android.content.Context.ASSETS;
+            java.io.File fake;
+            try {
+                fake = Tun2socks.fakeLibDir();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+            for (java.io.File d : new java.io.File[] { assets, fake }) {
+                String name = d.getName();
+                // createTempDirectory appends a random suffix; a fixed name has none.
+                check("fixture " + name + " is private to this JVM",
+                        name.matches(".*\\d{4,}$") || d.getAbsolutePath().startsWith(tmp + "/doft"),
+                        d.getAbsolutePath() + " is a name any other job on this host would "
+                                + "pick too — the second run cannot write it");
+                check("fixture " + name + " is writable",
+                        d.isDirectory() && d.canWrite(),
+                        d.getAbsolutePath() + " cannot be written by this run");
+            }
+            check("the fake binary was written, not inherited",
+                    new java.io.File(fake, "libtun2socks.so").canRead(),
+                    "no fake libtun2socks.so at " + fake.getAbsolutePath());
         });
 
         System.out.println(failures == 0 ? "ALL PASS" : (failures + " FAILURES"));

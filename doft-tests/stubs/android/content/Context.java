@@ -9,9 +9,37 @@ public class Context {
   public SharedPreferences getSharedPreferences(String name, int mode){ return null; }
   public Resources getResources(){ return new Resources(); }
   public ApplicationInfo getApplicationInfo(){ return new ApplicationInfo(); }
-  public File getExternalFilesDir(String s){ return new File("/tmp/doft-assets"); }
-  public File getDir(String s,int m){ return new File("/tmp/doft-assets"); }
-  public File getFilesDir(){ return new File("/tmp/doft-assets"); }
+  /**
+   * The app's private storage, as a directory THIS JVM owns.
+   *
+   * ⚠ IT WAS THE LITERAL /tmp/doft-assets, AND THAT CANNOT RUN TWICE ON ONE MACHINE.
+   * `/tmp` is shared by every user and every CI job on a host; a self-hosted runner keeps
+   * it between jobs. The sibling fixture in ServiceHarness had the same shape and it is
+   * the one that actually broke: writing its fake libtun2socks.so over a copy left by an
+   * earlier run threw AccessDeniedException, one case died before its first assertion, and
+   * the suite came back 315/1 on the runner while every local run was 316/0 — because on
+   * macOS `java.io.tmpdir` is a PER-USER directory under /var/folders, so the collision
+   * cannot happen there. A test fixture in a shared namespace is a test that passes only
+   * on the machine that ran it first.
+   */
+  public static final File ASSETS = makeAssets();
+
+  private static File makeAssets(){
+    try {
+      File d = java.nio.file.Files.createTempDirectory("doft-assets").toFile();
+      d.deleteOnExit();
+      return d;
+    } catch (Exception e) {
+      // Never fail a whole suite over a fixture path; the old behaviour is the fallback.
+      File d = new File("/tmp/doft-assets");
+      d.mkdirs();
+      return d;
+    }
+  }
+
+  public File getExternalFilesDir(String s){ return ASSETS; }
+  public File getDir(String s,int m){ return ASSETS; }
+  public File getFilesDir(){ return ASSETS; }
   public AssetManager getAssets(){ return new AssetManager(); }
   public String getPackageName(){ return "com.doft.vpn"; }
   public void sendBroadcast(Intent i){}

@@ -255,8 +255,16 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         }
 
         if (startCommand.equals(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE)) {
-            v2rayConfig = (V2rayConfig) intent.getSerializableExtra("V2RAY_CONFIG");
-            if (v2rayConfig == null) {
+            // ⚠ INTO A LOCAL, AND THE FIELD IS NOT PUBLISHED UNTIL THE LANE IS IDLE.
+            // The tun2socks watcher thread re-enters runTun2socks(), which reads
+            // v2rayConfig.LOCAL_SOCKS5_PORT and TUN2SOCKS_UDP_MODE — and that watcher
+            // belongs to the tunnel currently being torn down. Assigning the field first
+            // and joining after left a window in which the OLD tunnel's watcher respawned
+            // tun2socks against the NEW config's port. That window did not exist while the
+            // teardown ran ahead of this method on the same thread; the lane created it,
+            // so the lane's ordering has to close it.
+            final V2rayConfig incoming = (V2rayConfig) intent.getSerializableExtra("V2RAY_CONFIG");
+            if (incoming == null) {
                 return stopCleanly("V2RAY_CONFIG is null, cannot start service");
             }
             // ⚠ A START MAY NOT OVERLAP A TEARDOWN, AND IT WAITS RATHER THAN REFUSING
@@ -276,6 +284,7 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             // before the notification, on a ~10 s deadline. One join, and only when a
             // teardown is genuinely in flight.
             joinTeardown();
+            v2rayConfig = incoming;
             if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
                 // A start with no stop in front of it — a re-dial onto a different node.
                 // INLINE, and deliberately so: the lane is empty (we just joined it) and

@@ -1854,6 +1854,58 @@ public class ServiceHarness {
                     "claimed the exclusion held on a shut-down lane");
         });
 
+        // 41b. THE NEW CONFIG IS NOT PUBLISHED WHILE THE OLD TUNNEL IS STILL COMING DOWN.
+        //
+        //      ⚠ A WINDOW THE LANE CREATED, WHICH IS THE ONLY KIND THAT COUNTS AS A
+        //      REGRESSION HERE. The tun2socks watcher thread re-enters runTun2socks() when
+        //      the binary exits, and reads v2rayConfig.LOCAL_SOCKS5_PORT and
+        //      TUN2SOCKS_UDP_MODE — while belonging to the tunnel being torn down. With
+        //      the teardown ahead of this method on the same thread, the field could not
+        //      change under it. Assigning the field and joining afterwards put it back:
+        //      the OLD tunnel's watcher would respawn tun2socks against the NEW config's
+        //      port, i.e. a relay pointed at a listener that does not exist yet.
+        //
+        //      Reading the extra into a local costs nothing and keeps the cheap null check
+        //      where it was; only the PUBLICATION moves behind the join.
+        run(() -> {
+            resetWorld();
+            Disk disk = new Disk();
+            TestVpn s = new TestVpn(disk);
+            V2rayConfig first = config(null);
+            first.REMARK = "the-old-tunnel";
+            userStart(s, first);
+
+            java.util.concurrent.CountDownLatch open = wedgeLane(s);
+            s.onStartCommand(command(AppConfigs.V2RAY_SERVICE_COMMANDS.STOP_SERVICE, null), 0, 2);
+
+            V2rayConfig second = config(null);
+            second.REMARK = "the-new-tunnel";
+            Thread dial = new Thread(() -> s.onStartCommand(
+                    command(AppConfigs.V2RAY_SERVICE_COMMANDS.START_SERVICE, second), 0, 3),
+                    "harness-start");
+            dial.setDaemon(true);
+            dial.start();
+
+            // Long enough that a start which published first would have done so by now.
+            try { Thread.sleep(300L); } catch (InterruptedException ignored) { }
+            Object live = priv(s, V2rayVPNService.class, "v2rayConfig");
+            check("the field still names the tunnel that is coming down",
+                    live instanceof V2rayConfig
+                            && "the-old-tunnel".equals(((V2rayConfig) live).REMARK),
+                    "field already reads "
+                            + (live instanceof V2rayConfig ? ((V2rayConfig) live).REMARK : live)
+                            + " — the old watcher can respawn against the new port");
+
+            open.countDown();
+            try { dial.join(10000L); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            Object after = priv(s, V2rayVPNService.class, "v2rayConfig");
+            check("and it names the new one once the lane is idle",
+                    after instanceof V2rayConfig
+                            && "the-new-tunnel".equals(((V2rayConfig) after).REMARK),
+                    "field reads "
+                            + (after instanceof V2rayConfig ? ((V2rayConfig) after).REMARK : after));
+        });
+
         // 46b. A RE-DIAL REPLACES THE RUNNING CORE, IT DOES NOT STACK A SECOND ONE.
         //
         //      ⚠ NOTHING PINNED THIS, AND THE ROUND-5 MUTATION RUN SAID SO: deleting the

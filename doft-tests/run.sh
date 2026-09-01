@@ -31,7 +31,11 @@ mkdir -p build
 if [ ! -s "$JSON_JAR" ]; then
   curl -sSL -o "$JSON_JAR" https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
 fi
-rm -rf build/classes build/tclasses build/aclasses build/sclasses build/uclasses build/nclasses && mkdir -p build/classes
+# ⚠ EVERY OUTPUT DIRECTORY THIS SCRIPT COMPILES INTO. `build/pclasses` (the protector
+# harness, compiled below) was missing, so stale classes survived a local rerun and a
+# deleted test could keep passing from the previous build.
+rm -rf build/classes build/tclasses build/aclasses build/sclasses build/uclasses \
+       build/nclasses build/pclasses && mkdir -p build/classes
 
 TOTAL_CHECKS=0
 TOTAL_FAILURES=0

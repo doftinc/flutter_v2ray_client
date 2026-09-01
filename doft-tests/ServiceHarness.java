@@ -476,7 +476,10 @@ public class ServiceHarness {
             // cannot happen there. The gate that runs this suite at the pinned ref is what
             // surfaced it; nothing else was ever going to.
             java.io.File d = java.nio.file.Files.createTempDirectory("doft-fake-tun2socks").toFile();
-            d.deleteOnExit();
+            // ⚠ NOT `deleteOnExit()` — see Context.deleteTreeOnExit. This directory ALWAYS
+            // holds libtun2socks.so and execs.log, so `deleteOnExit` never unlinked it and
+            // every gate run left one more world-executable fixture behind on the runner.
+            android.content.Context.deleteTreeOnExit(d);
             log = new java.io.File(d, "execs.log");
             log.delete();
             java.io.File bin = new java.io.File(d, "libtun2socks.so");
@@ -2232,13 +2235,40 @@ public class ServiceHarness {
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
-            for (java.io.File d : new java.io.File[] { assets, fake }) {
+            // ⚠⚠ THE ACCESSORS, NOT ONLY THE FIELD. Production never touches `ASSETS`; it
+            // calls getFilesDir() (the tun2socks working directory), getDir() and
+            // getExternalFilesDir(). Checking the field alone let a mutant put ONLY
+            // getFilesDir() back on the shared path with the suite green — the very shape
+            // of the original bug, in the very case written to catch it.
+            android.content.Context ctx = new android.content.Context();
+            java.io.File[] fixtures = new java.io.File[] {
+                assets, fake, ctx.getFilesDir(), ctx.getDir("x", 0),
+                ctx.getExternalFilesDir(null),
+            };
+            // The two spellings this suite actually shipped, built through File so a
+            // java.io.tmpdir with a trailing slash (macOS) cannot make them unmatchable.
+            java.util.List<String> shared = java.util.Arrays.asList(
+                    new java.io.File("/tmp/doft-assets").getAbsolutePath(),
+                    new java.io.File(tmp, "doft-assets").getAbsolutePath(),
+                    new java.io.File("/tmp/doft-fake-tun2socks").getAbsolutePath(),
+                    new java.io.File(tmp, "doft-fake-tun2socks").getAbsolutePath());
+            for (java.io.File d : fixtures) {
                 String name = d.getName();
+                // ⚠ ONE CLAUSE, AND IT USED TO BE TWO JOINED BY `||`. The second was
+                // `d.getAbsolutePath().startsWith(tmp + "/doft")` — which on macOS is dead
+                // (java.io.tmpdir ends in a slash, so nothing starts with `…/T//doft`) and
+                // on Linux is TRUE FOR BOTH PRE-FIX PATHS, because there java.io.tmpdir IS
+                // `/tmp`. So the case that exists so "the next person does not need a
+                // second machine" passed on the bug, on the only machine that has it.
                 // createTempDirectory appends a random suffix; a fixed name has none.
                 check("fixture " + name + " is private to this JVM",
-                        name.matches(".*\\d{4,}$") || d.getAbsolutePath().startsWith(tmp + "/doft"),
+                        name.matches(".*\\d{4,}$"),
                         d.getAbsolutePath() + " is a name any other job on this host would "
                                 + "pick too — the second run cannot write it");
+                check("fixture " + name + " is not one of the shared spellings",
+                        !shared.contains(d.getAbsolutePath()),
+                        d.getAbsolutePath() + " is the exact path this suite used to "
+                                + "collide on");
                 check("fixture " + name + " is writable",
                         d.isDirectory() && d.canWrite(),
                         d.getAbsolutePath() + " cannot be written by this run");

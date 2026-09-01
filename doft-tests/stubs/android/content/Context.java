@@ -27,14 +27,52 @@ public class Context {
   private static File makeAssets(){
     try {
       File d = java.nio.file.Files.createTempDirectory("doft-assets").toFile();
-      d.deleteOnExit();
+      deleteTreeOnExit(d);
       return d;
     } catch (Exception e) {
-      // Never fail a whole suite over a fixture path; the old behaviour is the fallback.
-      File d = new File("/tmp/doft-assets");
-      d.mkdirs();
-      return d;
+      // ⚠ NO SILENT FALLBACK, AND THE ONE THAT WAS HERE RESTORED THE DEFECT THIS FIELD
+      // EXISTS TO DOCUMENT. It caught the exception and returned `new File("/tmp/doft-assets")`
+      // — the exact pre-fix path — with `mkdirs()`'s return value dropped. On the Linux
+      // runner that is the shared namespace again, and the sibling case that checks this
+      // (ServiceHarness case 50) would have passed on it, because its second clause
+      // ACCEPTED any path under `/tmp/doft`. Two guards shielding each other, so the bug
+      // could come back with the suite green.
+      //
+      // A fixture that cannot be made private is a suite that cannot be trusted, so it
+      // fails here and says why. `createTempDirectory` fails only if the temp directory is
+      // unwritable, which is not a condition any run should paper over.
+      throw new ExceptionInInitializerError(
+          "cannot create a private assets fixture under java.io.tmpdir="
+              + System.getProperty("java.io.tmpdir") + ": " + e
+              + " — refusing to fall back to the shared /tmp/doft-assets this field exists "
+              + "to avoid");
     }
+  }
+
+  /**
+   * Remove [d] and everything under it when this JVM exits.
+   *
+   * ⚠ `File.deleteOnExit()` DOES NOT DO THIS, and the comment that used to imply it was
+   * wrong in the direction that leaks. It unlinks a DIRECTORY only when the directory is
+   * empty at exit; the sibling tun2socks fixture always holds `libtun2socks.so` and
+   * `execs.log`, so every run left one more 0700 directory — each containing a file made
+   * executable for everyone — behind in the runner's temp namespace, unbounded. Measured
+   * on 2026-09-01: several from a single day's runs, all still present.
+   */
+  public static void deleteTreeOnExit(final File d){
+    Runtime.getRuntime().addShutdownHook(new Thread(){
+      @Override public void run(){ deleteTree(d); }
+    });
+  }
+
+  private static void deleteTree(File d){
+    File[] kids = d.listFiles();
+    if (kids != null) {
+      for (File k : kids) deleteTree(k);
+    }
+    // Best effort: a fixture we cannot remove is not worth failing an exiting JVM over,
+    // and there is no reporter left to tell at this point anyway.
+    d.delete();
   }
 
   public File getExternalFilesDir(String s){ return ASSETS; }

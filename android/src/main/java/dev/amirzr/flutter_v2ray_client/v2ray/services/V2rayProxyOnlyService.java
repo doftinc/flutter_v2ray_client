@@ -13,6 +13,26 @@ import dev.amirzr.flutter_v2ray_client.v2ray.utils.AppConfigs;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.AutoStartStore;
 import dev.amirzr.flutter_v2ray_client.v2ray.utils.V2rayConfig;
 
+/**
+ * ⚠ THIS SERVICE STILL TEARS DOWN ON THE CALLER'S THREAD, AND THAT IS A DECISION.
+ *
+ * <p>It shares the {@code :RunSoLibV2RayDaemon} process with {@link V2rayVPNService} and the
+ * process-wide {@link dev.amirzr.flutter_v2ray_client.v2ray.core.V2rayCoreManager} singleton,
+ * so everything said in that class about a synchronous {@code stopCore()} wedging the daemon's
+ * looper applies here word for word.
+ *
+ * <p>It is not fixed here because nothing reaches it: the app has exactly one call site,
+ * {@code lib/v2ray_vpn_bridge.dart}, and it passes {@code proxyOnly: false} unconditionally, so
+ * {@code AppConfigs.V2RAY_CONNECTION_MODE} is always {@code VPN_TUN} and both
+ * {@code V2rayController.StartV2ray} and {@code StopV2ray} address the VPN service. Giving this
+ * class its own lane would mean a second teardown lane against one shared core singleton — two
+ * of them could then run {@code stopLoop()} concurrently, which is worse than the wedge it would
+ * remove — and it would rework the proxy cases in doft-tests for a path no user takes.
+ *
+ * <p>⚠ SO IF THIS SERVICE EVER BECOMES REACHABLE, IT NEEDS THE FIX FIRST. Not its own lane: it
+ * must share the VPN service's, or serialise against it, because the thing being torn down is
+ * one object for the whole process.
+ */
 public class V2rayProxyOnlyService extends Service implements V2rayServicesListener {
 
     private static final String TAG = "V2rayProxyOnlyService";

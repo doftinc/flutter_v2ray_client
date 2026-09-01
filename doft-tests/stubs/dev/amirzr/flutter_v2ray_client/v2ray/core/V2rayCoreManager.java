@@ -68,6 +68,15 @@ public class V2rayCoreManager {
   public static volatile java.util.concurrent.CountDownLatch stopCoreLateGate = null;
   /** Set only by the lane thread, so "the lane finished" cannot be satisfied inline. */
   public static volatile boolean laneStopFinished = false;
+  /**
+   * stopCore() calls made from somewhere OTHER than the lane.
+   *
+   * ⚠ THE PLAIN COUNTER CANNOT ANSWER "did this thread tear down as well". The real stop
+   * recurses two deep — stopCore() -> stopService() -> stopAllProcess() -> stopCore() —
+   * so a lane teardown alone moves stopCoreCalls by two, and an assertion on the total
+   * reads that recursion as a second teardown by the caller. Split by thread instead.
+   */
+  public static volatile int stopCoreCallsOffLane = 0;
 
   public static void reset(){
     coreRunning = false; startCoreResult = true; startCoreCalls = 0;
@@ -75,6 +84,7 @@ public class V2rayCoreManager {
     totalDownloadBytes = 0L;
     stopCoreGate = null; stopCoreEntered = false; stopCoreFinished = false;
     stopCoreThread = ""; stopCoreLateGate = null; laneStopFinished = false;
+    stopCoreCallsOffLane = 0;
   }
 
   public long getTotalDownloadBytes(){ return totalDownloadBytes; }
@@ -92,6 +102,9 @@ public class V2rayCoreManager {
     stopCoreCalls++;
     stopCoreEntered = true;
     stopCoreThread = Thread.currentThread().getName();
+    if (!"v2ray-teardown".equals(stopCoreThread)) {
+      stopCoreCallsOffLane++;
+    }
     final java.util.concurrent.CountDownLatch gate = stopCoreGate;
     if (gate != null) {
       try {

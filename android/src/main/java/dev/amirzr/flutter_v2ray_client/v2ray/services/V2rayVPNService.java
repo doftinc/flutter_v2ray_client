@@ -119,23 +119,6 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
                         }
                     });
 
-    /**
-     * How long a start waits for an in-flight teardown before REFUSING rather than
-     * starting into it.
-     *
-     * <p>⚠ A BOUND, NOT A GUESS AT THE DURATION. Overlapping a start with a teardown is
-     * the one thing moving the stop off this thread could break: {@code stopAllProcess()}
-     * ends in {@code mInterface.close()}, {@code mInterface = null} and {@code stopSelf()},
-     * so a start that raced it would establish a tun the teardown then closes and a
-     * service the teardown then stops — "connected, no internet", the same symptom by a
-     * new route. Waiting makes the two exclusive; the bound is what keeps the wait itself
-     * off the ANR watchdog's list. Refusing is safe because the caller retries: the app's
-     * dial ladder treats a start that did not reach {@code connected} as a failed rung.
-     *
-     * <p>⚠ Not final: the harness lowers it so the refusal branch can be driven in a
-     * bounded run.
-     */
-    private static volatile long TEARDOWN_JOIN_MS = 4000L;
 
     /**
      * Run one teardown on {@link #teardownLane}, timed, and never let it escape.
@@ -171,17 +154,41 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
     }
 
     /**
-     * Wait until the lane is idle, or [budgetMs] passes. True when it drained.
+     * Wait until every teardown ordered before this call has finished. True when the lane
+     * is idle; false only when it could not be joined at all.
+     *
+     * <p>⚠⚠ UNBOUNDED, AND THE BOUNDED VERSION IS WHY. It first waited 4 s and then
+     * REFUSED the start — {@code stopCleanly()}, START_NOT_STICKY — on the reasoning that
+     * "the app's dial ladder treats a start that did not reach connected as a failed
+     * rung". An adversarial pass showed that is false, and the code that makes it false is
+     * in the plugin's own file: {@code FlutterV2rayPlugin.onMethodCall} answers
+     * {@code result.success(null)} for {@code startV2Ray} UNCONDITIONALLY, before any
+     * service has run, so a refusal never reaches Dart as an error. The ladder's escalation
+     * (penalise the endpoint, move to another node) lives only in its {@code catch} arm, so
+     * a refused start instead runs out the 30 s connect watchdog and lands on a 1-minute
+     * backoff against the SAME node.
+     *
+     * <p>And it would have been the ORDINARY path for exactly the affected users: every
+     * {@code bridge.start()} sends a stop and sleeps 400 ms first, so the start lands ~0.4 s
+     * into the teardown. On any device whose stop takes longer than ~4.4 s — the devices
+     * that reported this bug — every reconnect would have been refused. A fix whose failure
+     * mode is worse than the bug, on the population that has the bug.
+     *
+     * <p>So the start WAITS instead, for as long as the teardown takes. That is not a new
+     * risk: before this change the stop ran inside the same {@code onStartCommand} queue, so
+     * a start behind it waited exactly as long, on this exact thread. What changed is only
+     * WHICH call holds the thread — and a stop with no start behind it, which is what the
+     * user's Disconnect actually is, now holds it for no time at all.
      *
      * <p>Implemented as a BARRIER submitted behind whatever is queued, because that is
-     * the question actually being asked — "is every teardown ordered before me finished" —
-     * and it needs no shared state that could disagree with the executor's own.
+     * the question actually being asked, and it needs no shared state that could disagree
+     * with the executor's own.
      *
      * <p>⚠ NEVER CALL THIS FROM THE LANE. It would wait on the thread it is running on.
      * Every caller is a framework entry point on the main thread; nothing inside a
      * teardown calls it.
      */
-    private boolean joinTeardown(final long budgetMs) {
+    private boolean joinTeardown() {
         final java.util.concurrent.CountDownLatch drained =
                 new java.util.concurrent.CountDownLatch(1);
         try {
@@ -192,11 +199,18 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
                 }
             });
         } catch (Throwable t) {
-            // Nothing can be queued, so nothing is in flight to wait for.
-            return true;
+            // ⚠ FALSE, NOT TRUE. `shutdown()` is an ORDERLY shutdown: it refuses new work
+            // and lets what is already running RUN ON. Answering "drained" here told a
+            // caller the exclusion held while a teardown was still inside stopLoop() —
+            // proved with a standalone repro of this exact code. Nothing can be queued is
+            // not the same as nothing is in flight, and the honest answer is "I could not
+            // establish it".
+            Log.w(TAG, "teardown lane could not be joined", t);
+            return false;
         }
         try {
-            return drained.await(budgetMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            drained.await();
+            return true;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
@@ -245,25 +259,30 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
             if (v2rayConfig == null) {
                 return stopCleanly("V2RAY_CONFIG is null, cannot start service");
             }
-            // ⚠ A START MAY NOT OVERLAP A TEARDOWN — see TEARDOWN_JOIN_MS.
-            if (!joinTeardown(TEARDOWN_JOIN_MS)) {
-                return stopCleanly("a teardown was still in flight after "
-                        + TEARDOWN_JOIN_MS + " ms; refusing to start into it");
-            }
+            // ⚠ A START MAY NOT OVERLAP A TEARDOWN, AND IT WAITS RATHER THAN REFUSING
+            // — see joinTeardown. stopAllProcess() ends in mInterface.close(),
+            // mInterface = null and stopSelf(); a start that raced it would build a tun
+            // the teardown then closes and a service the teardown then stops, which is
+            // "connected, no internet" created by the fix.
+            //
+            // ⚠ AND THIS WAIT SITS IN FRONT OF startForeground(), WHICH IS WORTH SAYING
+            // OUT LOUD. showNotification() — the only startForeground() on this path — is
+            // inside startCore() below, and the foreground-service deadline has been
+            // running since the framework accepted startForegroundService(). But the
+            // exposure is not new: before the lane existed, a stop occupied this same
+            // onStartCommand queue and the start behind it waited exactly as long, with
+            // the same deadline already ticking. What must not be added on top is a
+            // SECOND wait — an earlier version had two joins here and could spend 8 s
+            // before the notification, on a ~10 s deadline. One join, and only when a
+            // teardown is genuinely in flight.
+            joinTeardown();
             if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
                 // A start with no stop in front of it — a re-dial onto a different node.
-                // Through the lane like every other teardown, so it is BOUNDED: inline,
-                // a stopLoop() that never returns took the whole process with it.
-                offTheMainThread("start: replacing a running core", new Runnable() {
-                    @Override
-                    public void run() {
-                        V2rayCoreManager.getInstance().stopCore();
-                    }
-                });
-                if (!joinTeardown(TEARDOWN_JOIN_MS)) {
-                    return stopCleanly("the running core did not stop within "
-                            + TEARDOWN_JOIN_MS + " ms");
-                }
+                // INLINE, and deliberately so: the lane is empty (we just joined it) and
+                // this thread has to hold the core still until startCore() replaces it,
+                // so handing it away and immediately waiting would buy nothing but a
+                // second way for the two to interleave.
+                V2rayCoreManager.getInstance().stopCore();
             }
             if (V2rayCoreManager.getInstance().startCore(v2rayConfig)) {
                 Log.i(TAG, "onStartCommand success => v2ray core started.");
@@ -313,6 +332,16 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
     private int restoreLastKnownGood(final String reason) {
         Log.i(TAG, "system-initiated start => " + reason);
 
+        // ⚠ AHEAD OF THE IDEMPOTENCE CHECK, NOT AFTER IT. The real stopLoop() clears the
+        // running flag before it returns, so a teardown parked anywhere after that point
+        // leaves isV2rayCoreRunning() false — but a teardown parked BEFORE it leaves the
+        // flag set, and the check below would then answer "the core is already running,
+        // nothing to restore", return START_STICKY, and let the lane kill the very core
+        // it just declined to rebuild. An always-on device would come back with no tunnel
+        // and nothing left to bring it back. Same exclusion the user-initiated start
+        // takes, and it costs nothing when the lane is idle.
+        joinTeardown();
+
         // Idempotent. The framework re-sends the always-on start intent, and tearing a
         // healthy tunnel down to rebuild it would be a self-inflicted outage.
         if (V2rayCoreManager.getInstance().isV2rayCoreRunning()) {
@@ -338,18 +367,6 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
         } catch (Throwable t) {
             Log.w(TAG, "VpnService.prepare failed", t);
             return stopCleanly("VpnService.prepare failed");
-        }
-
-        // ⚠ AHEAD OF THE BUDGET, AND THAT PLACEMENT IS THE POINT. Same exclusion the
-        // user-initiated start takes — a stop can still be draining in a process the
-        // framework has decided to start again — but a teardown we are waiting out is no
-        // more the config's fault than a consent we cannot ask for, and the check above
-        // refuses to charge the budget for exactly that reason. Written first BELOW this
-        // line, where a refusal spent one of the config's few attempts on a race; the
-        // mutation that deleted the wait is what sent me back to read the order.
-        if (!joinTeardown(TEARDOWN_JOIN_MS)) {
-            return stopCleanly("a teardown was still in flight after "
-                    + TEARDOWN_JOIN_MS + " ms; not restoring into it");
         }
 
         // A config that fails to start fails the same way every time, and always-on is
@@ -877,12 +894,25 @@ public class V2rayVPNService extends VpnService implements V2rayServicesListener
     public void onDestroy() {
         Log.i("V2rayVPNService", "onDestroy called - cleaning up resources");
         isRunning = false;
-        // ⚠ WAIT, DO NOT RACE. stopAllProcess() on the lane ends in stopSelf(), which is
-        // what brings the framework here — so this callback can arrive while that same
-        // teardown is between stopSelf() and mInterface.close(). Everything below is
-        // null-guarded and safe to run twice; running it CONCURRENTLY with the lane is
-        // what is not. The lane never waits on this thread, so this cannot deadlock.
-        joinTeardown(TEARDOWN_JOIN_MS);
+        // ⚠ WAIT, DO NOT RACE, AND WAIT WITHOUT A BOUND. stopAllProcess() on the lane
+        // ends in stopSelf(), which is what brings the framework here — so this callback
+        // can arrive while that same teardown is between stopSelf() and
+        // mInterface.close(). Everything below is null-guarded and safe to run twice;
+        // running it CONCURRENTLY with the lane is what is not. The lane never waits on
+        // this thread, so this cannot deadlock.
+        //
+        // ⚠⚠ AND THE BOUND THAT USED TO BE HERE HAD TWO TEETH. On timeout this method
+        // went on to call stopCore() ITSELF while the lane was still inside stopLoop() —
+        // a second, concurrent teardown of the same core, on the very thread this change
+        // exists to keep free, in exactly the slow-stop case it exists for. Worse, it
+        // then shut the lane down and returned, so a teardown could OUTLIVE the service:
+        // V2rayCoreManager is a process-wide singleton whose listener onCreate re-points
+        // at each new instance, so the abandoned teardown's stopService() callback would
+        // land on the NEXT service — closing a tun that a reconnect had just established
+        // and stopSelf()-ing a healthy tunnel. Waiting here is what makes the lane's
+        // lifetime a subset of the service's, which is the only reason nothing else in
+        // this class has to reason about cross-instance teardowns.
+        joinTeardown();
         teardownLane.shutdown();
         
         // Stop the V2ray core

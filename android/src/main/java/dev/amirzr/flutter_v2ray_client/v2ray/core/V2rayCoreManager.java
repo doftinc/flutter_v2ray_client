@@ -292,6 +292,34 @@ public final class V2rayCoreManager {
     }
 
     public void stopCore() {
+        // ⚠⚠ THE TICKER STOPS FIRST, BEFORE ANY OF THE TEARDOWN BELOW.
+        //
+        // This used to be cancelled at the very END, inside sendDisconnectedBroadCast(),
+        // and that was harmless for exactly one reason: the whole stop ran on the same
+        // looper the CountDownTimer ticks on, so no tick could interleave with it. Since
+        // V2rayVPNService moved its teardown onto its own lane that reason is gone — the
+        // looper is free for every second of a multi-second stop, and onTick() calls
+        // coreController.queryStats(tag, "downlink"/"uplink") on the SAME CoreController
+        // that stopLoop() is closing. Neither is synchronized (`javap -p` on libv2ray.aar:
+        // plain `public native long queryStats(...)`, `public native void stopLoop()`), and
+        // whether Go tolerates a stats read during Instance.Close() is not something this
+        // repo can answer. It does not have to: nothing needs a throughput sample from a
+        // core that is being shut down.
+        //
+        // Cancelling here also closes the smaller race the same window opened —
+        // sendDisconnectedBroadCast() and onTick() write V2RAY_STATE, SERVICE_DURATION and
+        // the four speed/traffic fields, none of them volatile, and they were single-
+        // threaded until now. A tick already dequeued still runs (cancel() only removes
+        // pending messages), so this narrows the window rather than closing it outright;
+        // what it removes is the multi-second one.
+        try {
+            if (countDownTimer != null) {
+                countDownTimer.cancel();
+            }
+        } catch (Exception e) {
+            Log.w("V2rayCoreManager", "Failed to cancel the duration timer", e);
+        }
+
         try {
             // Safely cancel notification - handle cases where service might be null
             if (v2rayServicesListener != null && v2rayServicesListener.getService() != null) {
